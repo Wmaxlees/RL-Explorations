@@ -485,12 +485,12 @@ if __name__ == "__main__":
         # Env/Run settings
         "NUM_ENVS": 4,          # Number of parallel environments
         "NUM_STEPS": 128,       # Steps per environment per update
-        "TOTAL_TIMESTEPS": 5e5, # Total env interactions
+        "TOTAL_TIMESTEPS": 1e7, # Total env interactions
         "ENV_NAME": "Breakout-MinAtar",
 
         # JEPA specific Hyperparameters
-        "EMBED_DIM": 8,        # Latent embedding dimension
-        "PREDICTOR_HIDDEN_DIM": 16,# Predictor MLP hidden size
+        "EMBED_DIM": 128,        # Latent embedding dimension
+        "PREDICTOR_HIDDEN_DIM": 256,# Predictor MLP hidden size
         "EMA_DECAY": 0.99,      # Target encoder EMA decay
 
         # PPO specific Hyperparameters
