@@ -47,7 +47,7 @@ class TrainConfig:
     # PPO Args
     total_timesteps: int = 2e7 # Total training steps
     num_steps: int = 512      # Steps per rollout per environment
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5
     anneal_lr: bool = True    # Linearly anneal learning rate
     gamma: float = 0.99       # Discount factor
     gae_lambda: float = 0.95  # GAE lambda parameter
@@ -59,19 +59,21 @@ class TrainConfig:
     max_grad_norm: float = 0.5 # Max gradient norm for clipping
 
     # Network Args
-    num_subroutines: int = 8  # Number of parallel subroutines (NOT USED in baseline AC)
-    selector_hidden_dims: Sequence[int] = (64,) # Hidden dims in the selector MLP (NOT USED)
-    subroutine_hidden_dims: Sequence[int] = (64, 32, 64,) # Hidden dims in each subroutine MLP (NOT USED)
-    final_head_hidden_dim: int = 128 # Hidden dim in the final combined MLP head (NOT USED)
-    selector_type: str = "sigmoid" # 'sigmoid' or 'topk_ott' (if available) (NOT USED)
-    topk_k: int = 4 # Value of K if selector_type is 'topk_ott' (NOT USED)
+    use_routing_network: bool = True
+    num_subroutines: int = 8  # Number of parallel subroutines
+    selector_hidden_dims: Sequence[int] = (64,) # Hidden dims in the selector MLP
+    subroutine_hidden_dims: Sequence[int] = (64, 32, 64,) # Hidden dims in each subroutine MLP
+    final_head_input_dim: int = 128 # Hidden dim in the final combined MLP head
+    selector_type: str = "sigmoid" # 'sigmoid' or 'topk_ott' (if available)
+    topk_k: int = 4 # Value of K if selector_type is 'topk_ott'
+    routing_activation: str = "relu"
     # Using standard AC network structure for clarity, will remove unused modular parts
     ac_hidden_dim: int = 512 # Hidden dim for AC network layers
     ac_activation: str = "tanh" # Activation for AC network
 
     # ICM Args
     train_icm: bool = True  # Enable ICM
-    icm_reward_coeff: float = 0.01 # Coefficient for intrinsic reward
+    icm_reward_coeff: float = 0.001 # Coefficient for intrinsic reward
     icm_lr: float = 1e-4           # Separate LR for ICM networks (often same as AC)
     icm_forward_loss_coef: float = 0.2 # Weight for forward dynamics loss (Burda et al.)
     icm_inverse_loss_coef: float = 0.8 # Weight for inverse dynamics loss (Burda et al.)
@@ -143,6 +145,65 @@ class Encoder(nn.Module):
         encoded_features = nn.Dense(features=self.embed_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         encoded_features = self.activation(encoded_features) # Use activation on output too? Common in some models.
         return encoded_features
+    
+class SubroutineSelector(nn.Module):
+    num_subroutines: int
+    hidden_dims: Sequence[int]
+    activation_fn: callable
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        h = x
+        for i, hidden_dim in enumerate(self.hidden_dims):
+            h = nn.Dense(features=hidden_dim, name=f"SelectorHidden_{i}",
+                         kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(h)
+            h = self.activation_fn(h)
+        routing_logits = nn.Dense(features=self.num_subroutines, name="SelectorOutputDense",
+                                  kernel_init=orthogonal(0.01), bias_init=constant(0.0))(h)
+        selection_weights = nn.sigmoid(routing_logits)
+        return selection_weights
+
+class TopKSelectorOTT(nn.Module):
+    num_subroutines: int
+    k: int
+    hidden_dims: Sequence[int]
+    activation_fn: callable
+    soft_sort_kwargs: dict = dataclasses.field(default_factory=lambda: {"temperature": 0.1})
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        if not OTT_AVAILABLE:
+            raise ImportError("OTT-JAX is required for TopKSelectorOTT but not installed.")
+        h = x
+        for i, hidden_dim in enumerate(self.hidden_dims):
+            h = nn.Dense(features=hidden_dim, name=f"SelectorHidden_{i}",
+                         kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(h)
+            h = self.activation_fn(h)
+        scores = nn.Dense(features=self.num_subroutines, name="SelectorOutputDense",
+                          kernel_init=orthogonal(1.0), bias_init=constant(0.0))(h)
+        ranks = soft_rank(scores, axis=-1, **self.soft_sort_kwargs)
+        inverted_ranks = (self.num_subroutines - 1) - ranks
+        threshold_rank_approx = self.num_subroutines - self.k
+        steepness = 10.0
+        soft_mask = nn.sigmoid((inverted_ranks - threshold_rank_approx) * steepness)
+        # print("Warning: TopKSelectorOTT outputs a heuristic soft mask based on soft ranks.") # Remove excessive print
+        return soft_mask
+
+class Subroutine(nn.Module):
+    hidden_dims: Sequence[int]
+    output_dim: int
+    activation_fn: callable
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        h = x
+        for i, hidden_dim in enumerate(self.hidden_dims):
+            h = nn.Dense(features=hidden_dim, name=f"SubroutineHidden_{i}",
+                         kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(h)
+            h = self.activation_fn(h)
+        output = nn.Dense(features=self.output_dim, name="SubroutineOutput",
+                          kernel_init=orthogonal(1.0), bias_init=constant(0.0))(h)
+        return output
 
 class ActorCriticNetwork(nn.Module):
     """Standard Actor-Critic Network."""
@@ -153,6 +214,7 @@ class ActorCriticNetwork(nn.Module):
     def __call__(self, obs: Dict[str, jnp.ndarray]):
         activation = get_activation(self.config.ac_activation)
         hidden_dim = self.config.ac_hidden_dim
+        routing_activation = get_activation(self.config.routing_activation)
 
         # --- Encoder ---
         # Using a simple 2-layer MLP encoder as in the original PPO baseline
@@ -175,13 +237,87 @@ class ActorCriticNetwork(nn.Module):
         encoded_state = nn.Dense(features=hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         encoded_state = activation(encoded_state)
 
+        if self.config.use_routing_network:
+            # --- 2a. Select Subroutines ---
+            if self.config.selector_type == "sigmoid":
+                selector = SubroutineSelector(
+                    num_subroutines=self.config.num_subroutines,
+                    hidden_dims=self.config.selector_hidden_dims,
+                    activation_fn=routing_activation,
+                    name="Selector"
+                )
+                selection_weights = selector(encoded_state) # Shape: (batch, num_subroutines)
+            elif self.config.selector_type == "topk_ott":
+                selector = TopKSelectorOTT(
+                    num_subroutines=self.config.num_subroutines,
+                    k=self.config.topk_k,
+                    hidden_dims=self.config.selector_hidden_dims,
+                    activation_fn=routing_activation,
+                    name="Selector"
+                )
+                selection_weights = selector(encoded_state) # Shape: (batch, num_subroutines) - soft mask
+            else:
+                raise ValueError(f"Unknown selector_type: {self.config.selector_type}")
+
+            # --- 2b. Run Subroutines ---
+            subroutine_outputs = []
+            subroutine_feature_dim = self.config.final_head_input_dim // self.config.num_subroutines
+            if subroutine_feature_dim == 0: subroutine_feature_dim = 1 # Ensure positive dim
+
+            for i in range(self.config.num_subroutines):
+                sub = Subroutine(
+                    hidden_dims=self.config.subroutine_hidden_dims,
+                    output_dim=subroutine_feature_dim,
+                    activation_fn=routing_activation,
+                    name=f"Subroutine_{i}"
+                )
+                # Each subroutine processes the original encoded state
+                sub_output = sub(encoded_state)
+                subroutine_outputs.append(sub_output)
+
+            # Stack outputs: Shape (batch, num_subroutines, sub_feature_dim)
+            all_sub_outputs = jnp.stack(subroutine_outputs, axis=1)
+
+            # --- 2c. Merge Subroutine Outputs (Weighted Sum) ---
+            # Expand weights for broadcasting: Shape (batch, num_subroutines, 1)
+            expanded_weights = jnp.expand_dims(selection_weights, axis=-1)
+            weighted_outputs = all_sub_outputs * expanded_weights
+            # Sum over subroutines: Shape (batch, sub_feature_dim)
+            merged_output = jnp.sum(weighted_outputs, axis=1)
+
+            # --- 2d. Skip Connection & Final Feature Prep ---
+            # Project encoded state if needed to match merged_output dim for combining
+            # OR project merged_output to match encoded_state dim
+            # OR concatenate and project down to final_head_input_dim
+            # Let's concatenate and project, similar to some residual MoE patterns:
+
+            # combined_skip_merge = jnp.concatenate([encoded_state, merged_output], axis=-1)
+            # combined_features = nn.Dense(features=self.config.final_head_input_dim, name="CombineProj",
+            #                              kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(combined_skip_merge)
+            # combined_features = routing_activation(combined_features)
+
+            # Alternative: Additive skip (like original) - requires projection if dims mismatch
+            if encoded_state.shape[-1] != merged_output.shape[-1]:
+                 # Project merged output to match encoder dim
+                 merged_output_proj = nn.Dense(features=encoded_state.shape[-1], name="MergeProjSkip",
+                                              kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(merged_output)
+                 combined_features = encoded_state + merged_output_proj # Additive skip
+            else:
+                 combined_features = encoded_state + merged_output # Additive skip
+            combined_features = routing_activation(combined_features) # Activation after skip
+
+
+        else:
+            # --- No Routing: Use encoded state directly ---
+            combined_features = encoded_state # Use output of the main encoder
+
         # --- Actor Head ---
-        actor_h = nn.Dense(features=hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(encoded_state)
+        actor_h = nn.Dense(features=hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(combined_features)
         actor_h = activation(actor_h)
         actor_logits = nn.Dense(features=self.num_actions, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(actor_h)
 
         # --- Critic Head ---
-        critic_h = nn.Dense(features=hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(encoded_state)
+        critic_h = nn.Dense(features=hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(combined_features)
         critic_h = activation(critic_h)
         critic_value = nn.Dense(features=1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic_h)
 
