@@ -85,7 +85,7 @@ def make_train(config):
     def train(rng):
         # INIT NETWORK
         if "Symbolic" in config["ENV_NAME"]:
-            network = ActorCritic(env.action_space(env_params).n, config["LAYER_SIZE"])
+            network = ActorCritic(env.action_space(env_params).n, config["LAYER_SIZE"], config["ROUTING_TYPE"], config["SUBROUTINES"], config["ROUTING_KEEP_COUNT"], config["NUM_ROUTING_PASSES"])
         else:
             network = ActorCriticConv(
                 env.action_space(env_params).n, config["LAYER_SIZE"]
@@ -217,7 +217,7 @@ def make_train(config):
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
-                pi, value = network.apply(train_state.params, last_obs)
+                pi, value, aux_loss = network.apply(train_state.params, last_obs, rngs={'gating_noise': _rng})
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
 
@@ -314,7 +314,7 @@ def make_train(config):
                 rng,
                 update_step,
             ) = runner_state
-            _, last_val = network.apply(train_state.params, last_obs)
+            _, last_val, aux_loss = network.apply(train_state.params, last_obs, rngs={'gating_noise': rng})
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -350,7 +350,7 @@ def make_train(config):
                     # Policy/value network
                     def _loss_fn(params, traj_batch, gae, targets):
                         # RERUN NETWORK
-                        pi, value = network.apply(params, traj_batch.obs)
+                        pi, value, aux_loss = network.apply(params, traj_batch.obs, rngs={'gating_noise': rng})
                         log_prob = pi.log_prob(traj_batch.action)
 
                         # CALCULATE VALUE LOSS
@@ -383,6 +383,7 @@ def make_train(config):
                             loss_actor
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
+                            + config["AUX_LOSS_COEF"] * aux_loss
                         )
                         return total_loss, (value_loss, loss_actor, entropy)
 
@@ -720,6 +721,13 @@ if __name__ == "__main__":
     parser.add_argument("--e3b_reward_coeff", type=float, default=1.0)
     parser.add_argument("--use_e3b", action="store_true")
     parser.add_argument("--e3b_lambda", type=float, default=0.1)
+
+    # Routing
+    parser.add_argument("--routing_type", type=str, default="switch")
+    parser.add_argument("--routing_keep_count", type=int, default=4)
+    parser.add_argument("--subroutines", type=int, default=16)
+    parser.add_argument("--num_routing_passes", type=int, default=4)
+    parser.add_argument("--aux_loss_coef", type=float, default=0.01)
 
     args, rest_args = parser.parse_known_args(sys.argv[1:])
     if rest_args:
