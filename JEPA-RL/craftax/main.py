@@ -52,7 +52,8 @@ try:
         ActorCritic,
         ActorCriticConv,
         ActorCriticJEPA,
-        ActorCriticForwardDynamics
+        ActorCriticICMIntegrated,
+        ForwardDynamicsAuxiliary,
     )
 except ImportError as e:
      print(f"Error importing actor_critic models: {e}")
@@ -130,7 +131,7 @@ def make_train(config: Dict):
          # Simple example: Use Forward Dynamics for vector envs, Image JEPA for pixels
          # Could be made more flexible with another argument like --aux_loss_type
          if is_symbolic_env:
-             config["AUX_LOSS_MODE"] = "forward_dynamics_vector"
+             config["AUX_LOSS_MODE"] = "icm_vector"
              config["INPUT_DIM"] = env_obs_space.shape[0] # Assuming Box
              print(f"Auxiliary Loss Enabled: Forward Dynamics (Vector) - Input Dim {config['INPUT_DIM']}")
          elif is_pixel_env:
@@ -182,24 +183,71 @@ def make_train(config: Dict):
         network = None
 
         # === NETWORK INITIALIZATION ===
-        if config["AUX_LOSS_MODE"] == "forward_dynamics_vector":
-            print("Initializing ActorCriticForwardDynamics Network...")
-            network = ActorCriticForwardDynamics(
+        if config["AUX_LOSS_MODE"] == "icm_vector":
+            print("Initializing ActorCriticICMIntegrated Network...")
+            network = ActorCriticICMIntegrated(
                 action_dim=action_dim, layer_width=config["LAYER_SIZE"],
                 fd_input_dim=config["INPUT_DIM"],
-                fd_encoder_output_dim=config["AUX_ENCODER_DIM"], # Use generic aux args
+                fd_encoder_output_dim=config["AUX_ENCODER_DIM"],
                 fd_encoder_hidden_dim=config["AUX_ENCODER_HIDDEN"],
                 fd_encoder_layers=config["AUX_ENCODER_LAYERS"],
                 fd_predictor_hidden_dim=config["AUX_PREDICTOR_HIDDEN"],
-                fd_predictor_layers=config["AUX_PREDICTOR_LAYERS"]
+                fd_predictor_layers=config["AUX_PREDICTOR_LAYERS"],
+                id_hidden_dim=config.get("AUX_INVERSE_HIDDEN", config["AUX_PREDICTOR_HIDDEN"]),
+                id_layers=config.get("AUX_INVERSE_LAYERS", 2)
             )
-            # Init requires dummy target params and potentially dummy action/next_obs if apply needs them
-            # For simplicity, assume init only needs obs shape (Flax usually handles this)
-            rng, _rng_aux_enc = jax.random.split(rng, 2)
-            # Dummy init call - might need adjustment based on exact ActorCriticForwardDynamics apply signature if it uses more args during init
-            dummy_encoder_params = network.forward_dynamics.encoder.init(_rng_aux_enc, init_x)['params']
-            network_params = network.init(_rng_net_init, init_x, jnp.zeros(1, dtype=jnp.int32), init_x, dummy_encoder_params)["params"] # Provide dummy args for init call
-            aux_target_params = jax.tree.map(lambda x: x, network_params['forward_dynamics_module']['online_encoder_mlp'])
+            rng, _rng_net_init, _rng_aux_enc = jax.random.split(rng, 3) # RNGs for init
+
+            # --- Create Dummy Target Params BEFORE Main Init ---
+            # We need the *structure* of the encoder params to create zeros.
+            # Instantiate the encoder module class definition directly.
+            try:
+                # Import JEPAEncoderMLP if necessary (adjust path if needed)
+                from models.jepa import JEPAEncoderMLP
+                temp_encoder_instance = JEPAEncoderMLP(
+                    output_dim=network.fd_encoder_output_dim,
+                    hidden_dim=network.fd_encoder_hidden_dim,
+                    num_layers=network.fd_encoder_layers
+                )
+                # Initialize this temporary instance just to get param shapes/dtypes
+                temp_encoder_params_struct = temp_encoder_instance.init(_rng_aux_enc, init_x)['params']
+                # Create dummy target params (zeros) with the same structure
+                dummy_target_params_init = jax.tree.map(
+                     lambda x: jnp.zeros(x.shape, x.dtype), temp_encoder_params_struct
+                )
+                del temp_encoder_instance, temp_encoder_params_struct # Clean up temporary stuff
+                print("Dummy target parameter structure created.")
+            except Exception as e:
+                print(f"Error creating dummy target parameters: {e}")
+                raise
+
+            # --- Corrected Init Call (Trace All Paths) ---
+            # Provide dummy values for ALL arguments of __call__
+            # and set calculate_aux=True to trace all paths.
+            dummy_action_init = jnp.zeros((1,), dtype=jnp.int32) # Batch size 1 for init
+
+            print("Initializing network parameters by tracing all paths...")
+            network_params = network.init(
+                 _rng_net_init,
+                 init_x,                            # obs_t
+                 action_t=dummy_action_init,        # dummy action_t
+                 obs_t_plus_1=init_x,               # dummy obs_t_plus_1
+                 target_encoder_params=dummy_target_params_init, # Use dummy target params
+                 calculate_aux=True                 # FORCE aux path tracing
+            )["params"]
+            print("Network parameters initialized.")
+            # --- End Corrected Init Call ---
+
+            # Initialize actual target parameters using the created online params
+            try:
+                 # Ensure path matches module names in setup: forward_module -> online_encoder_mlp
+                 online_encoder_params = network_params['forward_dynamics_module']['online_encoder_mlp']
+                 aux_target_params = jax.tree.map(lambda x: x, online_encoder_params)
+                 print("Actual target parameters created from initialized online encoder.")
+            except KeyError:
+                 print("ERROR: Could not find ['forward_module']['online_encoder_mlp'] parameters.")
+                 print("Initialized params structure:", jax.tree.map(lambda x: (x.shape, x.dtype), network_params))
+                 raise
 
         elif config["AUX_LOSS_MODE"] == "jepa_image":
             # ... (Initialization for ActorCriticJEPA as before) ...
@@ -275,32 +323,18 @@ def make_train(config: Dict):
 
                 # SELECT ACTION
                 rng_scan, _rng_action, _rng_net_call = jax.random.split(rng_scan, 3)
-                if config["AUX_LOSS_MODE"] == "forward_dynamics_vector":
-                    # Apply method needs obs_t, action_t, obs_t_plus_1, target_params
-                    # For ACTION SELECTION based on obs_t, we only need pi & value.
-                    # Pass dummy values for args not relevant to pi/value calculation from obs_t.
-                    # IMPORTANT: This assumes the internal network structure allows pi/value
-                    # calculation without depending on action_t/obs_t_plus_1 inputs.
-                    dummy_action = jnp.zeros_like(action) # Use action shape from previous step or default
-                    dummy_next_obs = last_obs_scan
-                    pi, value, _ = network.apply(
-                        {'params': train_state_scan.params},
-                        aux_target_params_scan,
-                        last_obs_scan,    # obs_t
-                        dummy_action,     # dummy action_t
-                        dummy_next_obs    # dummy obs_t_plus_1
-                    )
-                elif config["AUX_LOSS_MODE"] == "jepa_image":
-                    # Apply method needs obs, target_params, rng
-                    pi, value, _ = network.apply(
-                        {'params': train_state_scan.params},
-                        aux_target_params_scan,
-                        last_obs_scan,
-                        _rng_net_call # Pass RNG
-                    )
-                else: # No aux loss or unknown mode (treat as no aux loss for action selection)
-                    # Standard ActorCritic or ActorCriticConv call
-                    pi, value = network.apply({'params': train_state_scan.params}, last_obs_scan)
+                rng_scan, _rng_action = jax.random.split(rng_scan, 2)
+                # Use the dedicated method if available, otherwise call apply with only obs
+                if hasattr(network, 'get_policy_and_value'):
+                     pi, value = network.apply(
+                         {'params': train_state_scan.params},
+                         last_obs_scan,
+                         method=network.get_policy_and_value
+                     )
+                else:
+                     # Fallback: Call apply, ignore extra outputs if any
+                     outputs = network.apply({'params': train_state_scan.params}, last_obs_scan)
+                     pi, value = outputs[0], outputs[1] # Assume pi, value are first two returns
 
                 action = pi.sample(seed=_rng_action)
                 log_prob = pi.log_prob(action)
@@ -340,94 +374,156 @@ def make_train(config: Dict):
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
+            # --- CALCULATE INTRINSIC REWARD (If enabled) ---
+            intrinsic_reward = jnp.zeros_like(traj_batch.reward) # Shape (T, B)
+            avg_intrinsic_reward = 0.0 # For logging
+            if config["USE_INTRINSIC_REWARD"] and config["AUX_LOSS_MODE"] == "icm_vector":
+                # Need current params & target params
+                current_params = runner_state_after_scan.train_state.params
+                current_target_params = runner_state_after_scan.aux_target_params
+
+                # Define function to get raw error (needs careful parameter handling)
+                def _get_raw_forward_error_base(params_full, target_params_full, obs_t_flat, action_t_flat, next_obs_t_flat):
+                     # Instantiate the aux model part needed
+                     aux_model = ForwardDynamicsAuxiliary( # Assuming this is still the structure inside AC_ICMIntegrated
+                          input_dim=config["INPUT_DIM"], action_dim=action_dim,
+                          encoder_output_dim=config["AUX_ENCODER_DIM"], encoder_hidden_dim=config["AUX_ENCODER_HIDDEN"],
+                          encoder_layers=config["AUX_ENCODER_LAYERS"], predictor_hidden_dim=config["AUX_PREDICTOR_HIDDEN"],
+                          predictor_layers=config["AUX_PREDICTOR_LAYERS"]
+                     )
+                     # Apply using the relevant sub-tree of parameters
+                     _, raw_error = aux_model.apply(
+                         {'params': params_full['forward_dynamics_module']}, # variables dict (online params for forward_module)
+                         obs_t_flat[None,:],        # obs_t
+                         action_t_flat[None,],      # action_t (ensure batch dim added)
+                         next_obs_t_flat[None,:],   # obs_t_plus_1
+                         target_params_full,        # target_encoder_params (the dict of target enc params)
+                         method=aux_model.__call__  # Explicitly specify method
+                     )
+                     return jnp.squeeze(raw_error) # Remove added batch dim
+
+                # Now apply vmap explicitly to the base function
+                get_raw_forward_error_flat = jax.vmap(
+                    _get_raw_forward_error_base,    # The function to map
+                    in_axes=(None, None, 0, 0, 0)   # Axes specification
+                )
+
+                # Reshape data from (T, B, ...) to (T*B, ...)
+                T, B = traj_batch.obs.shape[0], traj_batch.obs.shape[1]
+                def flatten_batch(x): return x.reshape((T * B,) + x.shape[2:])
+                flat_obs_t = flatten_batch(traj_batch.obs)
+                flat_action_t = flatten_batch(traj_batch.action)
+                flat_next_obs_t = flatten_batch(traj_batch.next_obs)
+
+                # Calculate flat intrinsic rewards
+                flat_intrinsic_reward = get_raw_forward_error_flat(
+                    current_params, # Pass full params, vmap doesn't map this
+                    current_target_params, # Pass full target params, vmap doesn't map this
+                    flat_obs_t, flat_action_t, flat_next_obs_t # These are mapped
+                )
+
+                # Reshape back to (T, B)
+                intrinsic_reward = flat_intrinsic_reward.reshape(T, B)
+                # Normalize intrinsic reward (optional but common)
+                intrinsic_reward = (intrinsic_reward - intrinsic_reward.mean()) / (intrinsic_reward.std() + 1e-8)
+                avg_intrinsic_reward = intrinsic_reward.mean() # For logging
+
+
+            # --- Combine Rewards ---
+            combined_reward = traj_batch.reward + intrinsic_reward * config["INTRINSIC_REWARD_COEFF"]
 
             # --- CALCULATE ADVANTAGES ---
             # Need value prediction for the very last observation collected
             rng = runner_state_after_scan.rng
             rng, _rng_last_val_net = jax.random.split(rng)
-            if config["AUX_LOSS_MODE"] == "forward_dynamics_vector":
-                 # ActorCriticForwardDynamics apply needs obs_t, action_t, obs_t_plus_1, target_params
-                 # For *just* getting value, we only need obs_t (for policy/value heads).
-                 # We might need a separate method or adapt the apply call.
-                 # Let's assume get_embedding works and we can apply heads separately (cleaner)
-                 # OR adapt the apply call to handle value-only prediction.
-                 # Simple approach: Pass dummy values for unused args if apply must run fully
-                 dummy_action = jnp.zeros_like(traj_batch.action[0]) # Shape (B,)
-                 dummy_next_obs = runner_state_after_scan.last_obs
-                 pi_last, last_val, _ = network.apply(
+            # Get last value using the dedicated method or simplified apply
+            if hasattr(network, 'get_policy_and_value'):
+                 _, last_val = network.apply(
                      {'params': runner_state_after_scan.train_state.params},
-                     runner_state_after_scan.aux_target_params, # Pass target params
-                     runner_state_after_scan.last_obs, # obs_t
-                     dummy_action,                     # dummy action_t
-                     dummy_next_obs,                   # dummy obs_t_plus_1
+                     runner_state_after_scan.last_obs,
+                     method=network.get_policy_and_value
                  )
-            elif config["AUX_LOSS_MODE"] == "jepa_image":
-                 # ActorCriticJEPA needs obs, target_params, rng
-                  _, last_val, _ = network.apply(
-                      {'params': runner_state_after_scan.train_state.params},
-                      runner_state_after_scan.aux_target_params,
-                      runner_state_after_scan.last_obs,
-                      _rng_last_val_net
-                   )
             else:
-                 # Standard ActorCritic or ActorCriticConv just need obs
-                  _, last_val = network.apply(
-                      {'params': runner_state_after_scan.train_state.params},
-                      runner_state_after_scan.last_obs
-                  )
+                 outputs = network.apply({'params': runner_state_after_scan.train_state.params}, runner_state_after_scan.last_obs)
+                 last_val = outputs[1]
 
-            def _calculate_gae(traj_batch_gae: Transition, last_val_gae: jnp.ndarray):
-                """Calculates GAE."""
-                # Inner function for scan
-                def _get_advantages(gae_and_next_value, transition: Transition):
-                    gae, next_value = gae_and_next_value
-                    done, value, reward = transition.done, transition.value, transition.reward
-                    # Calculate delta and GAE for this step
-                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
-                    gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
-                    return (gae, value), gae # Return new state and GAE for this step
+            def _calculate_gae(traj_batch_gae: Transition, last_val_gae: jnp.ndarray, rewards_gae: jnp.ndarray):
+                 # rewards_gae is shape (T, B)
+                 T = traj_batch_gae.obs.shape[0] # Get time dimension length
+                 rewards_gae = jax.lax.stop_gradient(rewards_gae) # Stop gradients flowing through rewards
 
-                # Scan backward through transitions
-                _, advantages = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(last_val_gae), last_val_gae), # Initial state (gae=0, V(s_T))
-                    traj_batch_gae, # Transitions (T-1, ..., 0)
-                    reverse=True,
-                    unroll=16, # Optimization hint
-                )
-                # Advantages are computed; calculate targets (V(s) + A(s,a))
-                targets = advantages + traj_batch_gae.value
-                return advantages, targets
+                 def _get_advantages(gae_and_next_value, idx): # Scan over time index
+                     gae, next_value = gae_and_next_value
+                     # Get data for this time step t = T - 1 - idx (due to reverse)
+                     transition_t = jax.tree.map(lambda x: x[T-1-idx], traj_batch_gae)
+                     reward_t = rewards_gae[T-1-idx]
+                     # Calculate delta and GAE
+                     done, value = transition_t.done, transition_t.value
+                     delta = reward_t + config["GAMMA"] * next_value * (1 - done) - value
+                     gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                     return (gae, value), gae
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
+                 # Scan backward over time steps
+                 _, advantages = jax.lax.scan(
+                     _get_advantages,
+                     (jnp.zeros_like(last_val_gae), last_val_gae),
+                     jnp.arange(T), # Indices 0 to T-1
+                     reverse=False, # Scan 0..T-1 corresponds to t=T-1..0
+                 )
+                 # Result needs reversing? No, scan accumulates correctly based on reverse=True logic internally
+                 # Let's stick to the previous GAE implementation structure if it worked.
+                 # Reworking GAE scan is tricky. Assuming previous GAE worked with zipped input:
+
+                 def _get_advantages_zip(gae_and_next_value, transition_reward_tuple): # Original attempt
+                     gae, next_value = gae_and_next_value
+                     transition, reward = transition_reward_tuple # Unpack transition and its reward
+                     done, value = transition.done, transition.value # Get others from transition
+                     delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                     gae = delta + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                     return (gae, value), gae
+
+                 _, advantages = jax.lax.scan(
+                     _get_advantages_zip,
+                     (jnp.zeros_like(last_val_gae), last_val_gae),
+                     (traj_batch_gae, rewards_gae), # Zip transitions and rewards
+                     reverse=True, unroll=16,
+                 )
+
+                 targets = advantages + traj_batch_gae.value
+                 return advantages, targets
+
+            # Call GAE with combined reward
+            advantages, targets = _calculate_gae(traj_batch, last_val, combined_reward)
 
 
-            # === UPDATE NETWORK (PPO + optional JEPA) ===
+            # === UPDATE NETWORK ===
             def _update_epoch(update_state_epoch, unused_epoch_arg):
-                """Scans over minibatches for one epoch."""
                 train_state_epoch, aux_target_params_epoch, rng_epoch = update_state_epoch
-                
-                # --- Define Loss Function (incorporating JEPA if enabled) ---
-                def _loss_fn(params, aux_target_params_loss, traj_batch_loss: Transition, gae, targets_loss, rng_loss):
-                    """Calculates the combined PPO and JEPA loss."""
-                    if config["AUX_LOSS_MODE"] == "forward_dynamics_vector":
-                        aux_loss = 0.0
-                        # Requires obs_t, action_t, obs_t_plus_1, target_params
-                        pi, value, aux_loss = network.apply(
-                            {'params': params}, aux_target_params_loss,
-                            traj_batch_loss.obs, traj_batch_loss.action, traj_batch_loss.next_obs
-                        )
-                    elif config["AUX_LOSS_MODE"] == "jepa_image":
-                         # Requires obs, target_params, rng
-                         rng_loss, _rng_net = jax.random.split(rng_loss)
-                         pi, value, aux_loss = network.apply(
-                             {'params': params}, aux_target_params_loss,
-                             traj_batch_loss.obs, _rng_net
-                         )
-                    else: # No aux loss
-                        pi, value = network.apply({'params': params}, traj_batch_loss.obs)
 
-                    log_prob = pi.log_prob(traj_batch_loss.action)
+                # --- Define Loss Function ---
+                def _loss_fn(params, aux_target_params_loss, traj_batch_loss: Transition, gae, targets_loss):
+                    # Note: removed rng_loss as it wasn't used in vector mode apply
+                    forward_loss = 0.0
+                    inverse_loss = 0.0
+
+                    # Rerun network - ActorCriticICMIntegrated returns more outputs
+                    if config["AUX_LOSS_MODE"] == "icm_vector":
+                        pi, value, forward_loss_calc, inverse_logits_calc = network.apply(
+                            {'params': params},
+                            obs_t=traj_batch_loss.obs,
+                            action_t=traj_batch_loss.action,
+                            obs_t_plus_1=traj_batch_loss.next_obs,
+                            target_encoder_params=aux_target_params_loss,
+                            calculate_aux=True
+                        )
+                        # Need pi, value from obs_t only
+                        pi, value = network.apply({'params': params}, traj_batch_loss.obs, method=network.get_policy_and_value)
+
+
+                    elif config["AUX_LOSS_MODE"] == "jepa_image":
+                         pass
+                    else: # No aux loss
+                        pi, value = network.apply({'params': params}, traj_batch_loss.obs, method=network.get_policy_and_value)
 
                     # --- PPO Value Loss (Clipped) ---
                     value_pred_clipped = traj_batch_loss.value + (
@@ -438,6 +534,7 @@ def make_train(config: Dict):
                     value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
 
                     # --- PPO Actor Loss (Clipped Surrogate Objective) ---
+                    log_prob = pi.log_prob(traj_batch_loss.action)
                     ratio = jnp.exp(log_prob - traj_batch_loss.log_prob)
                     # Normalize advantages per minibatch
                     gae_norm = (gae - gae.mean()) / (gae.std() + 1e-8)
@@ -450,44 +547,61 @@ def make_train(config: Dict):
                     # --- PPO Entropy Bonus ---
                     entropy = pi.entropy().mean()
 
-                    # --- Total Joint Loss ---
-                    total_loss = (
-                        loss_actor
-                        + config["VF_COEF"] * value_loss
-                        - config["ENT_COEF"] * entropy
-                    )
-                    # Add JEPA loss component if JEPA is enabled
-                    total_loss = loss_actor + config["VF_COEF"] * value_loss - config["ENT_COEF"] * entropy
-                    loss_key = "aux_loss" # Generic key
-                    if config["USE_AUX_LOSS"]:
-                        total_loss += config["AUX_LOSS_COEF"] * aux_loss # Use generic coeff
+                    # --- ICM Inverse Loss ---
+                    if config["USE_AUX_LOSS"] and config["AUX_LOSS_MODE"] == "icm_vector":
+                         # --- Forward Loss ---
+                         # Correctly pass arguments matching get_forward_loss_and_error signature:
+                         # (self, obs_t, action_t, obs_t_plus_1, target_encoder_params)
+                         forward_loss, _ = network.apply(
+                             {'params': params},          # Parameter tree first
+                             traj_batch_loss.obs,         # obs_t
+                             traj_batch_loss.action,      # action_t
+                             traj_batch_loss.next_obs,    # obs_t_plus_1
+                             aux_target_params_loss,      # target_encoder_params
+                             method=network.get_forward_loss_and_error # Specify method
+                         )
 
-                    aux_losses_dict = {"ppo_value_loss": value_loss, "ppo_actor_loss": loss_actor, "ppo_entropy": entropy, "total_joint_loss": total_loss}
-                    if config["USE_AUX_LOSS"]: aux_losses_dict[loss_key] = aux_loss
+                         # --- Inverse Loss (if enabled) ---
+                         if config["USE_INVERSE_MODEL"]:
+                              # Correctly pass arguments matching get_inverse_logits signature:
+                              # (self, obs_t, obs_t_plus_1)
+                              inverse_logits = network.apply(
+                                  {'params': params},          # Parameter tree first
+                                  traj_batch_loss.obs,         # obs_t
+                                  traj_batch_loss.next_obs,    # obs_t_plus_1
+                                  method=network.get_inverse_logits # Specify method
+                              )
+                              # Cross-entropy loss (calculation is okay)
+                              action_one_hot = jax.nn.one_hot(traj_batch_loss.action, num_classes=action_dim)
+                              inv_loss_unmasked = -jnp.sum(action_one_hot * jax.nn.log_softmax(inverse_logits), axis=-1)
+                              inverse_loss = inv_loss_unmasked.mean()
+
+                    # --- Total Joint Loss ---
+                    total_loss = loss_actor + config["VF_COEF"] * value_loss - config["ENT_COEF"] * entropy
+                    aux_losses_dict = {"ppo_value_loss": value_loss, "ppo_actor_loss": loss_actor, "ppo_entropy": entropy}
+
+                    if config["USE_AUX_LOSS"] and config["AUX_LOSS_MODE"] == "icm_vector":
+                        total_loss += config["FORWARD_LOSS_COEF"] * forward_loss # Add forward loss
+                        aux_losses_dict["forward_loss"] = forward_loss
+                        if config["USE_INVERSE_MODEL"]:
+                            total_loss += config["INVERSE_LOSS_COEF"] * inverse_loss # Add inverse loss
+                            aux_losses_dict["inverse_loss"] = inverse_loss
+
+                    aux_losses_dict["total_joint_loss"] = total_loss
                     return total_loss, aux_losses_dict
 
                 # --- Minibatch Update Function ---
                 def _update_minibatch(train_state_and_rng_mb, batch_info_mb):
-                    """Performs update for a single minibatch."""
-                    train_state_mb, rng_mb = train_state_and_rng_mb
-                    traj_mb, advantages_mb, targets_mb = batch_info_mb
-                    rng_mb, _rng_grad = jax.random.split(rng_mb)
-
-                    # Calculate gradients using the combined loss function
-                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    (total_loss_mb, aux_losses_mb), grads = grad_fn(
-                        train_state_mb.params,
-                        aux_target_params_epoch, # Pass non-optimized target params
-                        traj_mb,
-                        advantages_mb,
-                        targets_mb,
-                        _rng_grad # Pass RNG for loss calculation
-                    )
-                    # Apply gradients -> updates PPO heads + JEPA online encoder/predictor
-                    train_state_mb = train_state_mb.apply_gradients(grads=grads)
-
-                    # Return updated state and losses for this minibatch
-                    return (train_state_mb, rng_mb), aux_losses_mb
+                     train_state_mb, rng_mb = train_state_and_rng_mb
+                     traj_mb, advantages_mb, targets_mb = batch_info_mb
+                     # Removed rng split as _loss_fn doesn't need it now for vector ICM
+                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                     (total_loss_mb, aux_losses_mb), grads = grad_fn(
+                         train_state_mb.params, aux_target_params_epoch,
+                         traj_mb, advantages_mb, targets_mb # Removed rng
+                     )
+                     train_state_mb = train_state_mb.apply_gradients(grads=grads)
+                     return (train_state_mb, rng_mb), aux_losses_mb
 
                 # --- Shuffle and Iterate Minibatches ---
                 rng_epoch, _rng_perm = jax.random.split(rng_epoch)
@@ -525,10 +639,9 @@ def make_train(config: Dict):
 
                     # Determine the correct path to the online encoder parameters
                     online_encoder_params = None
-                    if config["AUX_LOSS_MODE"] == "forward_dynamics_vector":
-                         online_encoder_params = train_state_after_mb_scan.params['forward_dynamics_module']['online_encoder_mlp']
-                    elif config["AUX_LOSS_MODE"] == "jepa_image":
-                         online_encoder_params = train_state_after_mb_scan.params['jepa_module']['online_encoder']
+                    if config["USE_AUX_LOSS"]:
+                        # Path for encoder within the forward_dynamics_module
+                        online_encoder_params = train_state_after_mb_scan.params['forward_dynamics_module']['online_encoder_mlp']
 
                     if online_encoder_params is not None:
                          updated_target_params = jax.tree.map(_ema_update, aux_target_params_epoch, online_encoder_params)
@@ -578,6 +691,8 @@ def make_train(config: Dict):
             metrics_to_log.update(agg_losses) # Add aggregated losses
             metrics_to_log["update_step"] = current_update_step # Add step number
             metrics_to_log["total_episodes"] = ep_ended_mask.sum() # Log how many episodes ended
+            if config["USE_INTRINSIC_REWARD"]:
+                metrics_to_log["avg_intrinsic_reward"] = avg_intrinsic_reward
 
             # --- WANDB Logging Callback ---
             if config["DEBUG"] and config["USE_WANDB"]:
@@ -757,16 +872,27 @@ if __name__ == "__main__":
     parser.add_argument("--activation", type=str, default="relu", choices=["relu", "tanh"], help="Activation function for MLP networks (if not using Conv/JEPA)")
     parser.add_argument("--anneal_lr", action=argparse.BooleanOptionalAction, default=True, help="Anneal learning rate linearly")
 
-    # --- JEPA Specific Args ---
+    # --- AUX Specific Args ---
     parser.add_argument("--use_aux_loss", action="store_true", help="Enable auxiliary loss (JEPA-Image or ForwardDynamics-Vector based on env)")
     parser.add_argument("--aux_encoder_dim", type=int, default=256, help="Output dim of auxiliary task encoder (MLP/CNN)")
     parser.add_argument("--aux_predictor_hidden", type=int, default=512, help="Hidden dim for aux task predictor MLP")
     parser.add_argument("--aux_predictor_layers", type=int, default=3, help="Num layers in aux task predictor MLP")
     parser.add_argument("--aux_ema_decay", type=float, default=0.996, help="EMA decay for aux task target encoder")
     parser.add_argument("--aux_loss_coef", type=float, default=1.0, help="Auxiliary loss coefficient")
-    parser.add_argument("--aux_input_dim", type=int, default=None, help="Input dim for Vector aux task (optional, detected if possible)")
+    parser.add_argument("--forward_loss_coef", type=float, default=1.0, help="Forward dynamics loss coefficient (if aux loss enabled)") # Renamed from aux_loss_coef
+
+    # Vector ICM specific args
     parser.add_argument("--aux_encoder_hidden", type=int, default=512, help="Hidden dim for Vector aux task MLP encoder")
     parser.add_argument("--aux_encoder_layers", type=int, default=3, help="Num hidden layers in Vector aux task MLP encoder")
+
+    # ICM Inverse Model Args
+    parser.add_argument("--use_inverse_model", action="store_true", help="Add ICM inverse dynamics model loss (requires --use_aux_loss)")
+    parser.add_argument("--inverse_loss_coef", type=float, default=0.1, help="ICM inverse dynamics loss coefficient") # Typical value
+    # Optionally add args for inverse model hidden dim/layers if needed
+
+    # ICM Intrinsic Reward Args
+    parser.add_argument("--use_intrinsic_reward", action="store_true", help="Use ICM forward model error as intrinsic reward (requires --use_aux_loss)")
+    parser.add_argument("--intrinsic_reward_coeff", type=float, default=0.01, help="Intrinsic reward coefficient")
 
     # --- Execution & Logging Args ---
     parser.add_argument("--seed", type=int, default=None, help="Random seed (if None, chosen randomly)")

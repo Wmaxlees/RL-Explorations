@@ -5,13 +5,14 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, Tuple, Callable
+from typing import Sequence, Tuple, Callable, Optional
 
 import distrax
 
 try:
     from .jepa import JEPA, JEPAVector
     from .jepa import ForwardDynamicsAuxiliary
+    from .jepa import InversePredictorMLP
 except ImportError:
     print("Warning: Could not import JEPA/JEPAVector/ForwardDynamicsAuxiliary models.")
     JEPA = None
@@ -419,15 +420,16 @@ class ActorCriticJEPAVector(nn.Module):
         return pi, jnp.squeeze(critic_output, axis=-1), jepa_loss
 
 
-class ActorCriticForwardDynamics(nn.Module):
+class ActorCriticICMIntegrated(nn.Module): # Renamed for clarity
     """
-    Actor-Critic network using an encoder trained with a forward dynamics auxiliary loss.
+    Actor-Critic network using an encoder trained with integrated
+    Forward Dynamics and Inverse Dynamics auxiliary losses (ICM style).
     Works with flat vector observations.
     """
-    action_dim: int # Env action dim
-    layer_width: int # Width of AC MLP heads
+    action_dim: int
+    layer_width: int
 
-    # Forward Dynamics specific parameters
+    # Encoder/Forward Dynamics parameters
     fd_input_dim: int
     fd_encoder_output_dim: int
     fd_encoder_hidden_dim: int
@@ -435,17 +437,21 @@ class ActorCriticForwardDynamics(nn.Module):
     fd_predictor_hidden_dim: int
     fd_predictor_layers: int
 
+    # Inverse Dynamics parameters (can share hidden dims or be different)
+    id_hidden_dim: int = 512
+    id_layers: int = 2
+
     activation_fn: Callable = nn.relu
 
 
     def setup(self):
-        if ForwardDynamicsAuxiliary is None:
-            raise ImportError("ForwardDynamicsAuxiliary model class not available.")
+        if ForwardDynamicsAuxiliary is None or InversePredictorMLP is None:
+            raise ImportError("Required auxiliary model classes not available.")
 
-        # Instantiate the ForwardDynamicsAuxiliary module
-        self.forward_dynamics = ForwardDynamicsAuxiliary(
+        # Instantiate Forward Dynamics module (provides Encoder + Forward Predictor)
+        self.forward_module = ForwardDynamicsAuxiliary(
             input_dim=self.fd_input_dim,
-            action_dim=self.action_dim, # Pass action_dim here
+            action_dim=self.action_dim,
             encoder_output_dim=self.fd_encoder_output_dim,
             encoder_hidden_dim=self.fd_encoder_hidden_dim,
             encoder_layers=self.fd_encoder_layers,
@@ -453,7 +459,16 @@ class ActorCriticForwardDynamics(nn.Module):
             predictor_layers=self.fd_predictor_layers,
             name="forward_dynamics_module")
 
-        # Define Actor/Critic MLP heads (same as ActorCritic / ActorCriticJEPAVector)
+        # Instantiate Inverse Dynamics predictor
+        self.inverse_predictor = InversePredictorMLP(
+            action_dim=self.action_dim,
+            embedding_dim=self.fd_encoder_output_dim,
+            hidden_dim=self.id_hidden_dim,
+            num_layers=self.id_layers,
+            name="inverse_predictor_module"
+        )
+
+        # --- Actor/Critic Heads ---
         self.actor_fc1 = nn.Dense(self.layer_width, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0), name="actor_fc1")
         self.actor_fc2 = nn.Dense(self.layer_width, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0), name="actor_fc2")
         self.actor_logits = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="actor_logits")
@@ -461,42 +476,80 @@ class ActorCriticForwardDynamics(nn.Module):
         self.critic_fc2 = nn.Dense(self.layer_width, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0), name="critic_fc2")
         self.critic_value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0), name="critic_value")
 
-    def __call__(self, obs_t: jnp.ndarray, action_t: jnp.ndarray, obs_t_plus_1: jnp.ndarray, target_encoder_params: dict):
+    # --- Helper Methods ---
+    def get_embedding(self, obs: jnp.ndarray) -> jnp.ndarray:
+        """Applies the encoder."""
+        return self.forward_module.get_embedding(obs)
+
+    def get_policy_and_value(self, obs: jnp.ndarray):
+         """Gets policy and value from observation."""
+         embedding_t = self.get_embedding(obs)
+         # Actor head
+         actor_x = self.actor_fc1(embedding_t); actor_x = self.activation_fn(actor_x)
+         actor_x = self.actor_fc2(actor_x); actor_x = self.activation_fn(actor_x)
+         actor_logits = self.actor_logits(actor_x)
+         pi = distrax.Categorical(logits=actor_logits)
+         # Critic head
+         critic_x = self.critic_fc1(embedding_t); critic_x = self.activation_fn(critic_x)
+         critic_x = self.critic_fc2(critic_x); critic_x = self.activation_fn(critic_x)
+         critic_output = self.critic_value(critic_x)
+         value = jnp.squeeze(critic_output, axis=-1)
+         return pi, value
+
+    def get_forward_loss_and_error(self, obs_t: jnp.ndarray, action_t: jnp.ndarray, obs_t_plus_1: jnp.ndarray, target_encoder_params: dict) -> Tuple[jnp.ndarray, jnp.ndarray]:
+         """Calls the forward dynamics module."""
+         return self.forward_module(obs_t, action_t, obs_t_plus_1, target_encoder_params)
+
+    def get_inverse_logits(self, obs_t: jnp.ndarray, obs_t_plus_1: jnp.ndarray) -> jnp.ndarray:
+         """Calculates inverse dynamics logits."""
+         # Use ONLINE encoder for both embeddings
+         embedding_t = self.get_embedding(obs_t)
+         embedding_t_plus_1 = self.get_embedding(obs_t_plus_1)
+         return self.inverse_predictor(embedding_t, embedding_t_plus_1)
+    
+    def get_auxiliary_outputs(self, obs_t: jnp.ndarray, action_t: jnp.ndarray, obs_t_plus_1: jnp.ndarray, target_encoder_params: dict):
+        """Calculates forward loss, raw error, and inverse logits."""
+        # Get forward loss and raw error
+        forward_loss, raw_forward_error = self.forward_module(obs_t, action_t, obs_t_plus_1, target_encoder_params)
+
+        # Get embeddings needed for inverse model (using ONLINE encoder)
+        embedding_t = self.forward_module.get_embedding(obs_t)
+        embedding_t_plus_1 = self.forward_module.get_embedding(obs_t_plus_1) # ONLINE encoder
+
+        # Get inverse model prediction
+        inverse_logits = self.inverse_predictor(embedding_t, embedding_t_plus_1)
+
+        return forward_loss, raw_forward_error, inverse_logits
+
+    def __call__(self, obs_t: jnp.ndarray, # Always required
+                       action_t: Optional[jnp.ndarray] = None,
+                       obs_t_plus_1: Optional[jnp.ndarray] = None,
+                       target_encoder_params: Optional[dict] = None,
+                       calculate_aux: bool = False): # Flag to compute aux losses
         """
-        Forward pass. Calculates policy, value, and forward dynamics loss.
-
-        Args:
-            obs_t: Current observations (B, input_dim).
-            action_t: Actions taken in obs_t (B,).
-            obs_t_plus_1: Next observations (B, input_dim).
-            target_encoder_params: Parameters for the target encoder.
-
-        Returns:
-            Tuple: (policy_distribution, value_prediction, forward_dynamics_loss)
+        Main apply function. Returns policy and value.
+        If calculate_aux is True and other inputs are provided, also computes aux losses/logits.
         """
-        if obs_t.ndim != 2:
-             raise ValueError(f"{type(self).__name__} expects flat vector obs_t (B, input_dim), got {obs_t.shape}")
+        pi, value = self.get_policy_and_value(obs_t)
 
-        # 1. Get embedding of current state for policy/value heads
-        embedding_t = self.forward_dynamics.get_embedding(obs_t)
+        # --- Always compute Inverse Logits if possible (ensures init) ---
+        # Initialize placeholder
+        inverse_logits = jnp.zeros((obs_t.shape[0], self.action_dim))
+        if obs_t_plus_1 is not None:
+             # This ensures self.inverse_predictor is traced during init if dummy obs_t_plus_1 is passed
+             inverse_logits = self.get_inverse_logits(obs_t, obs_t_plus_1)
 
-        # 2. Calculate Forward Dynamics loss using the auxiliary module
-        # This requires obs_t, action_t, obs_t_plus_1, and target params
-        forward_loss = self.forward_dynamics(obs_t, action_t, obs_t_plus_1, target_encoder_params)
+        # --- Conditionally compute Forward Loss ---
+        forward_loss = 0.0 # Placeholder
+        if calculate_aux:
+            if action_t is None or obs_t_plus_1 is None or target_encoder_params is None:
+                raise ValueError("Missing inputs required for auxiliary loss calculation.")
+            # Calculate Forward Loss (only loss value needed for return signature)
+            forward_loss, _ = self.get_forward_loss_and_error(obs_t, action_t, obs_t_plus_1, target_encoder_params)
+            # Note: Inverse logits are already computed above if obs_t_plus_1 was provided
+            # If we only run inverse when calculate_aux is True, uncomment the line below
+            # and comment out the block above that calculates inverse_logits
+            # inverse_logits = self.get_inverse_logits(obs_t, obs_t_plus_1)
 
-        # --- Actor head (uses current embedding_t) ---
-        actor_x = self.actor_fc1(embedding_t)
-        actor_x = self.activation_fn(actor_x)
-        actor_x = self.actor_fc2(actor_x)
-        actor_x = self.activation_fn(actor_x)
-        actor_logits = self.actor_logits(actor_x)
-        pi = distrax.Categorical(logits=actor_logits)
-
-        # --- Critic head (uses current embedding_t) ---
-        critic_x = self.critic_fc1(embedding_t)
-        critic_x = self.activation_fn(critic_x)
-        critic_x = self.critic_fc2(critic_x)
-        critic_x = self.activation_fn(critic_x)
-        critic_output = self.critic_value(critic_x)
-
-        return pi, jnp.squeeze(critic_output, axis=-1), forward_loss
+        # Always return the same structure
+        return pi, value, forward_loss, inverse_logits

@@ -215,10 +215,37 @@ class ForwardPredictorMLP(nn.Module):
         return x
 
 
+class InversePredictorMLP(nn.Module):
+    """
+    Predicts action logits from two consecutive state embeddings.
+    """
+    action_dim: int         # Number of discrete actions (output logits)
+    embedding_dim: int      # Dimension of the state embedding input
+    hidden_dim: int = 512
+    num_layers: int = 2     # Often simpler than forward model
+    activation: Callable = nn.relu
+
+    @nn.compact
+    def __call__(self, embedding_t, embedding_t_plus_1):
+        # Concatenate consecutive state embeddings
+        # Ensure inputs have shape (B, embedding_dim)
+        if embedding_t.shape != embedding_t_plus_1.shape or embedding_t.ndim != 2:
+             raise ValueError("InversePredictorMLP inputs must have matching shape (B, embedding_dim)")
+
+        x = jnp.concatenate([embedding_t, embedding_t_plus_1], axis=-1)
+        # Pass through MLP
+        for i in range(self.num_layers):
+            x = nn.Dense(features=self.hidden_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0), name=f"dense_{i}")(x)
+            x = self.activation(x)
+        # Output logits for each action
+        action_logits = nn.Dense(features=self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0), name="action_logits")(x)
+        return action_logits    
+
+
 class ForwardDynamicsAuxiliary(nn.Module):
     """
-    Auxiliary module using Encoder + Forward Predictor + Target Encoder.
-    Calculates forward prediction loss for vector observations.
+    Auxiliary module calculating forward prediction loss and raw error.
+    Encoder is trained by this loss AND the separate inverse model loss.
     """
     input_dim: int
     action_dim: int # Needed for the predictor
@@ -229,7 +256,6 @@ class ForwardDynamicsAuxiliary(nn.Module):
     predictor_layers: int
 
     def setup(self):
-        # Define online encoder and predictor using MLPs
         self.encoder = JEPAEncoderMLP(output_dim=self.encoder_output_dim,
                                       hidden_dim=self.encoder_hidden_dim,
                                       num_layers=self.encoder_layers,
@@ -240,21 +266,18 @@ class ForwardDynamicsAuxiliary(nn.Module):
                                                  hidden_dim=self.predictor_hidden_dim,
                                                  num_layers=self.predictor_layers,
                                                  name="forward_predictor_mlp")
-        # Target encoder uses the same architecture (JEPAEncoderMLP) but separate parameters (handled via EMA)
+        # Target encoder uses the same architecture (JEPAEncoderMLP)
 
-    def __call__(self, obs_t: jnp.ndarray, action_t: jnp.ndarray, obs_t_plus_1: jnp.ndarray, target_encoder_params: dict) -> jnp.ndarray:
+    def __call__(self, obs_t: jnp.ndarray, action_t: jnp.ndarray, obs_t_plus_1: jnp.ndarray, target_encoder_params: dict) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Calculates Forward Dynamics prediction loss.
-
-        Args:
-            obs_t: Current observations (B, input_dim).
-            action_t: Actions taken (B,).
-            obs_t_plus_1: Next observations (B, input_dim).
-            target_encoder_params: Parameters for the target encoder.
+        Calculates Forward Dynamics prediction loss and raw error.
 
         Returns:
-            Forward prediction loss (scalar).
+            Tuple[forward_loss, raw_forward_error_per_sample]:
+                - forward_loss: Scalar loss (potentially normalized) for gradients.
+                - raw_forward_error_per_sample: Raw prediction error (e.g., MSE) per sample (B,) for intrinsic reward.
         """
+        # ... (Input shape checks as before) ...
         if obs_t.ndim != 2 or obs_t.shape[-1] != self.input_dim:
             raise ValueError(f"ForwardDynamicsAuxiliary expects obs_t shape (B, {self.input_dim}), got {obs_t.shape}")
         if obs_t_plus_1.ndim != 2 or obs_t_plus_1.shape[-1] != self.input_dim:
@@ -262,36 +285,28 @@ class ForwardDynamicsAuxiliary(nn.Module):
         if action_t.ndim != 1:
             raise ValueError(f"ForwardDynamicsAuxiliary expects action_t shape (B,), got {action_t.shape}")
 
-
-        # Encode current state with the online encoder
         phi_t = self.encoder(obs_t)
-
-        # Predict next state embedding using current embedding and action
         phi_hat_t_plus_1 = self.forward_predictor(phi_t, action_t)
 
-        # Encode *actual* next state with the target encoder (using provided parameters)
-        target_encoder_instance = JEPAEncoderMLP(output_dim=self.encoder_output_dim,
-                                                 hidden_dim=self.encoder_hidden_dim,
-                                                 num_layers=self.encoder_layers,
-                                                 name="target_encoder_apply_mlp")
         phi_target_t_plus_1 = jax.lax.stop_gradient(
-            target_encoder_instance.apply({'params': target_encoder_params}, obs_t_plus_1)
+            self.encoder.apply({'params': target_encoder_params}, obs_t_plus_1)
         )
 
-        # --- Calculate Loss (MSE on normalized embeddings) ---
+        # --- Calculate Raw Error (MSE) for Intrinsic Reward ---
+        # Sum squared errors across embedding dimension, shape (B,)
+        raw_error_per_sample = jnp.sum(jnp.square(phi_hat_t_plus_1 - phi_target_t_plus_1), axis=-1)
+
+        # --- Calculate Loss (potentially normalized MSE) for gradients ---
         def normalize(v):
             return v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + 1e-6)
+        # Using normalized loss for gradients as per JEPA influence
+        normalized_loss = jnp.mean(jnp.sum((normalize(phi_hat_t_plus_1) - normalize(phi_target_t_plus_1))**2, axis=-1))
 
-        loss = jnp.mean(jnp.sum((normalize(phi_hat_t_plus_1) - normalize(phi_target_t_plus_1))**2, axis=-1))
-
-        # Return only the loss
-        return loss
+        return normalized_loss, raw_error_per_sample
 
     def get_embedding(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Get embedding from the online encoder for the full (unmasked) vector."""
         if x.ndim != 2:
-            raise ValueError(f"ForwardDynamicsAuxiliary.get_embedding expects input shape (B, {self.input_dim}), got {x.shape}")
-        # This method is still used by the Actor-Critic heads
+             raise ValueError(f"ForwardDynamicsAuxiliary.get_embedding expects input shape (B, {self.input_dim}), got {x.shape}")
         return self.encoder(x)
 
 class PredictorMLP(nn.Module):
