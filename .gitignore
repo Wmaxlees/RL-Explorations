@@ -1,0 +1,6 @@
+# Python Stuff
+*.pyc
+__pycache__/
+
+# Weights and Biases stuff
+wandb/
