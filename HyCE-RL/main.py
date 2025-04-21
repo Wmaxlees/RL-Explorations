@@ -34,6 +34,12 @@ class Config:
     selector_hidden_dim: int = 512
     min_skills_per_agent: int = 4
 
+    # EA Hyperparameters
+    num_elites: int = 10
+    selector_param_mutation_std: float = 0.01
+    skill_mask_mutation_rate: float = 0.05
+
+
 @struct.dataclass
 class TrajectoryData:
     """Stores trajectory data from one evaluation phase."""
@@ -46,6 +52,33 @@ class TrajectoryData:
     skill_indices: chex.Array # Shape [P, T]
     agent_indices: chex.Array # Shape [P, T]
     next_values: chex.Array # Shape [P, T] (Value estimates from critic V(s'))
+
+
+def mutate_selector_params(params: Any, key: chex.PRNGKey, stddev: float) -> Any:
+    """Adds Gaussian noise to the selector parameters."""
+    mutated_params = jax.tree_util.tree_map(
+        lambda p: p + jax.random.normal(key, p.shape, p.dtype) * stddev,
+        params
+    )
+    # TODO(wmaxlees): This simple noise addition might not be ideal for all layers/params.
+    # More sophisticated mutation might be needed for complex networks.
+    return mutated_params
+
+def mutate_skill_mask(mask: chex.Array, key: chex.PRNGKey, rate: float, min_skills: int) -> chex.Array:
+    """Flips bits in the skill mask with a given probability, ensuring min_skills."""
+    mutation_noise = jax.random.uniform(key, mask.shape)
+
+    flipped_mask = jnp.where(mutation_noise < rate, ~mask, mask)
+
+    num_available = jnp.sum(flipped_mask, axis=-1, keepdims=True)
+
+    needs_more = num_available < min_skills
+
+    final_mask = jnp.where(needs_more, mask, flipped_mask)
+
+    # TODO: Implement a better way to add skills back if needed_more is True.
+
+    return final_mask
 
 
 def init_shared_skills(config: Config, key: chex.PRNGKey, action_dim: int) -> chex.Array:
@@ -303,38 +336,58 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
     return new_train_state, trajectory_data
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=('config'))
 def run_evolution_phase(train_state: TrainState, config: Config) -> TrainState:
-    """Applies EA selection and variation to the population_agent_states."""
-    # 1. Select parents based on train_state.population_fitness.
-    # 2. Generate new population_agent_states by applying variation (mutation/crossover)
-    #    to selected parents' selector_params and skill_subset_mask.
-    #    Requires careful PRNG key splitting for mutations.
-    # 3. Return train_state with the updated population_agent_states and split prng_key.
-
-    print("Evolving population...") # Replace with actual implementation
+    """Applies EA selection and variation (elitism + mutation) to the population."""
+    print("Evolving population...")
     key, key_select, key_mutate_selector, key_mutate_mask = jax.random.split(train_state.prng_key, 4)
 
-    # --- Placeholder EA ---
-    # Select top 50% based on fitness
-    num_parents = config.population_size // 2
-    indices = jnp.argsort(train_state.population_fitness)[-num_parents:] # Indices of fittest
+    # --- Selection ---
+    elite_indices = jnp.argsort(train_state.population_fitness)[-config.num_elites:]
 
-    # Simple Mutation: Replace bottom 50% with mutated copies of top 50%
-    offspring_indices = jax.random.choice(key_select, indices, (config.population_size - num_parents,))
-    parent_indices = jnp.concatenate([indices, offspring_indices]) # New population sources
+    num_offspring = config.population_size - config.num_elites
+    offspring_source_indices = jax.random.choice(key_select, elite_indices, shape=(num_offspring,))
 
-    # Select parent states based on indices (using JAX indexing on pytrees)
-    # new_pop_agent_states = jax.tree_map(lambda x: x[parent_indices], train_state.population_agent_states)
+    new_pop_source_indices = jnp.concatenate([elite_indices, offspring_source_indices])
 
-    # Apply mutation (example: Gaussian noise to selector, flip bit for mask)
-    # mutated_params = mutate_selector(new_pop_agent_states.selector_params, key_mutate_selector)
-    # mutated_mask = mutate_mask(new_pop_agent_states.skill_subset_mask, key_mutate_mask)
-    # new_pop_agent_states = new_pop_agent_states._replace(selector_params=mutated_params, skill_subset_mask=mutated_mask)
-    # --- End Placeholder ---
+    base_population_states = jax.tree_util.tree_map(
+        lambda x: x[new_pop_source_indices],
+        train_state.population_agent_states
+    )
+
+    # --- Variation (Mutation) ---
+    selector_mutation_keys = jax.random.split(key_mutate_selector, num_offspring)
+    mask_mutation_keys = jax.random.split(key_mutate_mask, num_offspring)
+
+    offspring_base_params = jax.tree_util.tree_map(lambda x: x[config.num_elites:], base_population_states.selector_params)
+    offspring_base_masks = base_population_states.skill_subset_mask[config.num_elites:]
+
+    mutated_offspring_params = jax.vmap(
+        mutate_selector_params, in_axes=(0, 0, None) # Map over params-pytree and keys
+    )(offspring_base_params, selector_mutation_keys, config.selector_param_mutation_std)
+
+    mutated_offspring_masks = jax.vmap(
+        mutate_skill_mask, in_axes=(0, 0, None, None) # Map over mask and keys
+    )(offspring_base_masks, mask_mutation_keys, config.skill_mask_mutation_rate, config.min_skills_per_agent)
+
+    # --- Combine Elites and Mutated Offspring ---
+    elite_params = jax.tree_util.tree_map(lambda x: x[:config.num_elites], base_population_states.selector_params)
+    elite_masks = base_population_states.skill_subset_mask[:config.num_elites]
+
+    new_selector_params = jax.tree_util.tree_map(
+        lambda elite, offspring: jnp.concatenate([elite, offspring], axis=0),
+        elite_params,
+        mutated_offspring_params
+    )
+    new_skill_subset_mask = jnp.concatenate([elite_masks, mutated_offspring_masks], axis=0)
+
+    new_population_agent_states = AgentState(
+        selector_params=new_selector_params,
+        skill_subset_mask=new_skill_subset_mask
+    )
 
     return train_state._replace(
-        # population_agent_states=new_pop_agent_states, # Uncomment when implemented
+        population_agent_states=new_population_agent_states,
         prng_key=key
     )
 
