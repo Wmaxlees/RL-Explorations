@@ -6,7 +6,9 @@ import functools
 import jax
 import jax.numpy as jnp
 import optax
+import time
 from typing import Any, List, Tuple, Optional, Dict
+import wandb
 
 from lib.networks import SkillSelector, SkillPolicy, SkillCritic, Embedder
 from lib.states import TrainState, AgentState, SkillTrainState
@@ -39,7 +41,7 @@ class Config:
     selector_param_mutation_std: float = 0.01
     skill_mask_mutation_rate: float = 0.05
 
-    # --- ADDED: PPO Hyperparameters ---
+    # PPO Hyperparameters
     ppo_epochs: int = 4
     ppo_num_minibatches: int = 4
     gamma: float = 0.99
@@ -49,6 +51,11 @@ class Config:
     ent_coef: float = 0.01
     target_kl: Optional[float] = None
     gradient_accumulation_steps: int = 16
+
+    # WandB Config
+    wandb_project: str = "HyCE-RL"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
 
 @struct.dataclass
@@ -337,11 +344,14 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
         "obs": train_state.obs,
         "env_state": train_state.env_state,
         "accumulated_reward": jnp.zeros(config.population_size, dtype=jnp.float32),
+        "total_skills_selected": jnp.zeros((config.population_size, config.num_skills), dtype=jnp.int32),
     }
 
     def step_env_scan_body(carry, _unused_step_idx):
         key, current_obs, current_env_state, accumulated_reward = \
             carry["key"], carry["obs"], carry["env_state"], carry["accumulated_reward"]
+        accumulated_reward = carry["accumulated_reward"]
+        total_skills_selected = carry["total_skills_selected"]
 
         agent_indices_step = jnp.arange(config.population_size)
 
@@ -356,6 +366,9 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
                 {'params': agent_states.selector_params}, embeddings, agent_states.skill_subset_mask
             ) # Shape [P, N_skill]
         skill_indices_k = jax.random.categorical(select_key, selector_logits) # Shape [P]
+
+        skill_one_hot = jax.nn.one_hot(skill_indices_k, num_classes=config.num_skills, dtype=jnp.int32)
+        new_total_skills_selected = total_skills_selected + skill_one_hot
 
         stacked_policy_params = jax.tree_util.tree_map(
             lambda *x: jnp.stack(x), *[s.policy_params for s in train_state.shared_skill_states]
@@ -429,7 +442,8 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
             "key": key,
             "obs": next_obs,
             "env_state": next_env_state,
-            "accumulated_reward": new_accumulated_reward
+            "accumulated_reward": new_accumulated_reward,
+            "total_skills_selected": new_total_skills_selected
         }
         return next_carry, transition
 
@@ -445,12 +459,23 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
     final_env_state = final_carry["env_state"]
     # Use accumulated reward over the trajectory as fitness
     final_fitness = final_carry["accumulated_reward"]
+    final_total_skills_selected = final_carry["total_skills_selected"] # Shape [P, N_skill]
 
     # Transpose collected data to [P, T, ...]
     trajectory_data_transposed = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), collected_transitions_stacked)
 
     # Pack into TrajectoryData structure
     trajectory_data = TrajectoryData(**trajectory_data_transposed)
+
+    eval_metrics = {
+        "eval/fitness_mean": jnp.mean(final_fitness),
+        "eval/fitness_median": jnp.median(final_fitness),
+        "eval/fitness_max": jnp.max(final_fitness),
+        "eval/fitness_min": jnp.min(final_fitness),
+        "eval/fitness_std": jnp.std(final_fitness),
+        "eval/avg_skill_usage_fraction": jnp.mean(final_total_skills_selected / num_steps, axis=0), # Average fraction usage per skill across pop [N_skill]
+        # Add more metrics as needed
+    }
 
     # Update TrainState
     new_train_state = train_state._replace(
@@ -461,7 +486,7 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
         timestep=train_state.timestep + num_steps * config.population_size
     )
 
-    return new_train_state, trajectory_data
+    return new_train_state, trajectory_data, eval_metrics
 
 
 @functools.partial(jax.jit, static_argnames=('config'))
@@ -472,6 +497,7 @@ def run_evolution_phase(train_state: TrainState, config: Config) -> TrainState:
 
     # --- Selection ---
     elite_indices = jnp.argsort(train_state.population_fitness)[-config.num_elites:]
+    elite_fitness = train_state.population_fitness[elite_indices]
 
     num_offspring = config.population_size - config.num_elites
     offspring_source_indices = jax.random.choice(key_select, elite_indices, shape=(num_offspring,))
@@ -514,13 +540,23 @@ def run_evolution_phase(train_state: TrainState, config: Config) -> TrainState:
         skill_subset_mask=new_skill_subset_mask
     )
 
-    return train_state._replace(
+    avg_skills_per_agent = jnp.mean(jnp.sum(new_skill_subset_mask, axis=-1))
+
+    evo_metrics = {
+        "evo/elite_fitness_mean": jnp.mean(elite_fitness),
+        "evo/elite_fitness_min": jnp.min(elite_fitness),
+        "evo/elite_fitness_max": jnp.max(elite_fitness),
+        "evo/avg_skills_per_agent": avg_skills_per_agent,
+    }
+
+    new_train_state = train_state._replace(
         population_agent_states=new_population_agent_states,
         prng_key=key
     )
+    return new_train_state, evo_metrics
 
 
-@functools.partial(jax.jit, static_argnames=("config","action_dim")) # Jitting this whole thing might be hard
+# @functools.partial(jax.jit, static_argnames=("config","action_dim")) # Jitting this whole thing might be hard
 def run_skill_refinement_phase(
     train_state: TrainState,
     config: Config,
@@ -530,6 +566,7 @@ def run_skill_refinement_phase(
     """Filters data, runs PPO updates for skills and shared embedder."""
     print("Refining skills using PPO...")
     key = train_state.prng_key
+    ppo_metrics_aggregated = {} # Initialize dict for metrics
 
     num_top_agents_float = config.population_size * 4 / 10
     num_top_agents = int(num_top_agents_float)
@@ -554,11 +591,15 @@ def run_skill_refinement_phase(
     # ---
 
     print(f"  Filtered steps from top agents: {num_filtered_steps}")
+    ppo_metrics_aggregated["ppo/num_agents_filtered"] = float(num_top_agents) # Convert JAX scalar
+    ppo_metrics_aggregated["ppo/num_steps_filtered"] = float(num_filtered_steps)
+
     min_req_steps = config.ppo_num_minibatches
     if num_filtered_steps < min_req_steps:
         print(f"  Skipping PPO updates: Not enough data ({num_filtered_steps}) for {config.ppo_num_minibatches} minibatches.")
         key, _ = jax.random.split(key)
-        return train_state._replace(prng_key=key)
+        ppo_metrics_aggregated["ppo/skipped_updates"] = 1.0
+        return train_state._replace(prng_key=key), ppo_metrics_aggregated
 
     # --- 2. Calculate GAE for ALL filtered data ---
     # Calculate GAE once for the whole filtered dataset
@@ -576,6 +617,8 @@ def run_skill_refinement_phase(
         advantages=advantages,
         targets=targets
     )
+    ppo_metrics_aggregated["ppo/advantages_mean"] = float(jnp.mean(advantages))
+    ppo_metrics_aggregated["ppo/targets_mean"] = float(jnp.mean(targets))
     # ---
 
     # --- 3. Initialize Loop Variables ---
@@ -587,6 +630,8 @@ def run_skill_refinement_phase(
     critic_tx = optax.adam(learning_rate=config.skill_critic_lr)
     optimizers = (embedder_tx, policy_tx, critic_tx)
 
+    epoch_metrics = []
+
     # --- 4. PPO Epoch Loop ---
     for epoch in range(config.ppo_epochs):
         key, shuffle_key = jax.random.split(key)
@@ -595,6 +640,8 @@ def run_skill_refinement_phase(
 
         accumulated_embedder_grads = jax.tree_util.tree_map(jnp.zeros_like, current_embedder_params)
         updates_counted_for_embedder = 0
+
+        minibatch_metrics = []
 
         # --- 5. Minibatch Loop (Iterate over the *whole* filtered dataset) ---
         minibatch_size = num_filtered_steps // config.ppo_num_minibatches
@@ -617,6 +664,8 @@ def run_skill_refinement_phase(
         for i in range(actual_num_minibatches):
             minibatch = jax.tree_util.tree_map(lambda x: x[i], minibatched_data)
 
+            step_metrics_for_minibatch = []
+
             # --- 6. Skill Loop (Apply updates for each skill based on this minibatch) ---
             for k in range(config.num_skills):
                 # a. Get current states for skill k
@@ -632,6 +681,9 @@ def run_skill_refinement_phase(
                     config,
                     action_dim
                 )
+
+                metrics['skill_index'] = k
+                step_metrics_for_minibatch.append(metrics)
 
                 # Check if any updates happened for this skill (mask was not all False)
                 # If skill_k_active_ratio is 0, grads might be zero/NaN - skip update?
@@ -682,6 +734,29 @@ def run_skill_refinement_phase(
                          # updates_counted_for_embedder = 0 # If resetting here
 
             # End skill loop
+            if step_metrics_for_minibatch:
+                agg_mb_metrics = {}
+                keys_to_avg = ["total_loss", "policy_loss", "value_loss", "entropy", "approx_kl",
+                               "grad_norm/embedder", "grad_norm/policy", "grad_norm/critic",
+                               "skill_k_active_ratio"]
+                num_skills_active_in_mb = sum(m['skill_k_active_ratio'] > 1e-6 for m in step_metrics_for_minibatch)
+
+                for metric_name in keys_to_avg:
+                    # Average only over skills that were active in this minibatch
+                    valid_vals = [m[metric_name] for m in step_metrics_for_minibatch if metric_name in m and m['skill_k_active_ratio'] > 1e-6]
+                    if valid_vals:
+                        # Ensure values are numeric before mean
+                        numeric_vals = [v for v in valid_vals if isinstance(v, (int, float, jax.Array))]
+                        if numeric_vals:
+                           # Also update the f-string key below
+                           agg_mb_metrics[f"mb_avg/{metric_name}"] = jnp.mean(jnp.array(numeric_vals)).item()
+                        else:
+                           agg_mb_metrics[f"mb_avg/{metric_name}"] = float('nan')
+                    else:
+                         # Also update the f-string key below
+                        agg_mb_metrics[f"mb_avg/{metric_name}"] = 0.0
+
+                minibatch_metrics.append(agg_mb_metrics)
         # End minibatch loop
 
         # Apply final embedder update for any remaining accumulated gradients at end of epoch
@@ -695,9 +770,30 @@ def run_skill_refinement_phase(
              )
              current_embedder_params = optax.apply_updates(current_embedder_params, embedder_updates)
              current_embedder_opt_state = new_embedder_opt_state
+        
+        if minibatch_metrics:
+          epoch_agg = {}
+          # Get all the keys from the first minibatch's aggregated metrics
+          # (Assumes all minibatch dicts have the same keys)
+          all_mb_keys = minibatch_metrics[0].keys()
+
+          # --- Use a different loop variable name ---
+          for mb_metric_key in all_mb_keys:
+              # Calculate the mean for this metric across all minibatches in the epoch
+              # Add .item() to store a Python float in epoch_agg
+              epoch_agg[f"epoch_avg/{mb_metric_key}"] = jnp.mean(jnp.array([m[mb_metric_key] for m in minibatch_metrics])).item()
+
+          epoch_metrics.append(epoch_agg)
         # End epoch final embedder update
 
     # End epoch loop
+
+    if epoch_metrics:
+        final_keys = epoch_metrics[0].keys()
+        for final_key in final_keys:
+             # Average the epoch averages
+             ppo_metrics_aggregated[f"ppo/{final_key.replace('epoch_avg/mb_avg/', '')}"] = float(jnp.mean(jnp.array([e[final_key] for e in epoch_metrics])))
+             # Example key becomes: ppo/total_loss
 
     # Update the main train state
     final_train_state = train_state._replace(
@@ -707,11 +803,18 @@ def run_skill_refinement_phase(
         prng_key=key
     )
 
-    return final_train_state
+    return final_train_state, ppo_metrics_aggregated
 
 
 def main():
     config = Config() # Load config
+
+    wandb.init(project=config.wandb_project,
+        config=vars(config),
+        name=config.wandb_run_name,
+        save_code=False,
+    )
+    config = Config(**wandb.config) # Update config with sweep params if any
 
     env = make_craftax_env_from_name(config.env_name, True)
     env = BatchEnvWrapper(env, num_envs=config.population_size)
@@ -719,31 +822,56 @@ def main():
     obs_shape = env.observation_space(env_params).shape
     action_dim = env.action_space(env_params).n # Get action_dim
 
-    # Define GBL update function (e.g., PPO, SAC step)
-    # gbl_update_fn = create_gbl_update_function(config, SkillPolicy(), SkillCritic(), action_dim, obs_shape) # Placeholder
-
     # Initialize training state
     train_state = init_train_state(config, env)
 
     num_generations = 100 # Example
-    eval_steps_per_generation = 1000 # Example
+    eval_steps_per_generation = 100 # Example
+
+    start_time = time.time()
 
     for generation in range(num_generations):
+        gen_start_time = time.time()
+        logs = {"generation": generation, "timesteps": train_state.timestep}
         print(f"\n--- Generation {generation} ---")
 
         # 1. Evaluation Phase
-        train_state, trajectory_data = run_evaluation_phase(train_state, config, env, env.default_params, eval_steps_per_generation)
+        eval_start_time = time.time()
+        train_state, trajectory_data, eval_metrics = run_evaluation_phase(train_state, config, env, env.default_params, eval_steps_per_generation)
+        eval_time = time.time() - eval_start_time
+        logs.update({k: float(v) for k, v in eval_metrics.items() if 'avg_skill_usage_fraction' not in k})
+        for i, usage in enumerate(eval_metrics["eval/avg_skill_usage_fraction"]):
+            logs[f"eval/skill_{i}_usage_fraction"] = float(usage)
+        logs["timing/eval_phase_sec"] = eval_time
         print(f"Max Fitness: {jnp.max(train_state.population_fitness):.2f}")
 
         # 2. Evolution Phase
-        train_state = run_evolution_phase(train_state, config)
+        evo_start_time = time.time()
+        train_state, evo_metrics = run_evolution_phase(train_state, config)
+        evo_time = time.time() - evo_start_time
+        logs.update({k: float(v) for k, v in evo_metrics.items()}) # Convert JAX scalars
+        logs["timing/evo_phase_sec"] = evo_time
 
         # 3. Skill Refinement Phase
-        train_state = run_skill_refinement_phase(
+        refine_start_time = time.time()
+        train_state, ppo_metrics = run_skill_refinement_phase(
              train_state, config, trajectory_data, action_dim
         )
+        refine_time = time.time() - refine_start_time
+        logs.update(ppo_metrics) # Already floats from the function
+        logs["timing/refine_phase_sec"] = refine_time
 
-        # (Add logging, saving checkpoints, etc.)
+        gen_time = time.time() - gen_start_time
+        logs["timing/generation_sec"] = gen_time
+        total_elapsed_time = time.time() - start_time
+        logs["timing/total_elapsed_sec"] = total_elapsed_time
+        logs["timing/sps"] = (eval_steps_per_generation * config.population_size) / gen_time # Steps per second
+
+        wandb.log(logs)
+
+        # (Add saving checkpoints, etc.)
+
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
