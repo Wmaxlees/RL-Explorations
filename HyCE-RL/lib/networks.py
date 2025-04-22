@@ -52,4 +52,4 @@ class SkillCritic(nn.Module):
         x = nn.Dense(features=self.hidden_dim)(x)
         x = nn.relu(x)
         x = nn.Dense(features=1)(x)
-        return x
+        return x.squeeze(axis=-1)

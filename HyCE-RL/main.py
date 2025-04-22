@@ -6,7 +6,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import optax
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Optional, Dict
 
 from lib.networks import SkillSelector, SkillPolicy, SkillCritic, Embedder
 from lib.states import TrainState, AgentState, SkillTrainState
@@ -14,8 +14,8 @@ from lib.env_wrappers import BatchEnvWrapper, GymnaxWrapper
 
 
 class Config:
-    population_size: int = 100
-    num_skills: int = 16
+    population_size: int = 10 # 100
+    num_skills: int = 4 # 16
     env_name: str = "Craftax-Symbolic-v1"
     seed: int = 42
 
@@ -39,6 +39,17 @@ class Config:
     selector_param_mutation_std: float = 0.01
     skill_mask_mutation_rate: float = 0.05
 
+    # --- ADDED: PPO Hyperparameters ---
+    ppo_epochs: int = 4
+    ppo_num_minibatches: int = 4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_eps: float = 0.2
+    vf_coef: float = 0.5
+    ent_coef: float = 0.01
+    target_kl: Optional[float] = None
+    gradient_accumulation_steps: int = 16
+
 
 @struct.dataclass
 class TrajectoryData:
@@ -52,7 +63,124 @@ class TrajectoryData:
     skill_indices: chex.Array # Shape [P, T]
     agent_indices: chex.Array # Shape [P, T]
     next_values: chex.Array # Shape [P, T] (Value estimates from critic V(s'))
+    advantages: Optional[chex.Array] = None # Shape [N] after GAE
+    targets: Optional[chex.Array] = None    # Shape [N] after GAE
 
+
+
+def calculate_gae(
+    rewards: chex.Array, # Shape [N_steps]
+    values: chex.Array, # Shape [N_steps] - V(s_t)
+    next_values: chex.Array, # Shape [N_steps] - V(s_{t+1})
+    dones: chex.Array, # Shape [N_steps]
+    gamma: float,
+    gae_lambda: float
+) -> Tuple[chex.Array, chex.Array]:
+    """Calculates GAE advantages and value targets."""
+    next_values_corrected = jnp.where(dones, 0.0, next_values)
+
+    deltas = rewards + gamma * next_values_corrected - values
+    advantages = jnp.zeros_like(rewards)
+    last_gae_lam = 0.0
+
+    # Scan function remains the same, operates over the single dimension
+    def _adv_scan_step(carry, delta_and_done):
+        gae_lam = carry
+        delta, done = delta_and_done
+        gae_lam = delta + gamma * gae_lambda * (1.0 - done) * gae_lam
+        return gae_lam, gae_lam
+
+    # Scan backwards through the single (time) dimension
+    _, advantages_reversed = jax.lax.scan(
+        _adv_scan_step, last_gae_lam, (deltas, dones), reverse=True
+    )
+    advantages = jnp.flip(advantages_reversed, axis=0) # Flip the single dimension back
+
+    targets = advantages + values
+    # Returns 1D arrays: advantages [N_steps], targets [N_steps]
+    return advantages, targets
+
+def ppo_update_step(
+params_to_update: Tuple[Any, Any, Any], # (embedder_params, policy_params_k, critic_params_k)
+    # Opt states/optimizers removed, handled by caller
+    full_minibatch: Dict, # The full minibatch from shuffled_filtered_data
+    skill_k_index: int, # Index of the skill being updated
+    config: Config,
+    action_dim: int
+) -> Tuple[Tuple[Any, Any, Any], Dict]: # Returns (embedder_grads, policy_grads_k, critic_grads_k), metrics
+    """Calculates PPO loss and gradients for one skill's data within a minibatch."""
+
+    embedder_params, policy_params_k, critic_params_k = params_to_update
+
+    # Instantiate networks
+    embedder_net = Embedder(hidden_dim=config.embedder_hidden_dim, embedding_dim=config.embedder_embedding_dim)
+    skill_policy_net = SkillPolicy(hidden_dim=config.skill_policy_hidden_dim, action_dim=action_dim)
+    skill_critic_net = SkillCritic(hidden_dim=config.skill_critic_hidden_dim)
+
+    # Define PPO loss function for skill k, operating on the full minibatch
+    def ppo_loss_fn(embed_p, policy_p, critic_p, mb):
+        # Extract data from the full minibatch
+        obs = mb.observations
+        actions = mb.actions
+        log_probs_old = mb.log_probs
+        skill_indices_mb = mb.skill_indices
+        adv = mb.advantages
+        targets = mb.targets
+
+        # --- Create mask for skill k within the minibatch ---
+        skill_k_mask = (skill_indices_mb == skill_k_index) # Boolean mask [minibatch_size]
+        # ---
+
+        # Forward pass for ALL data points in minibatch
+        embeddings = embedder_net.apply({'params': embed_p}, obs)
+        new_logits = skill_policy_net.apply({'params': policy_p}, embeddings)
+        new_values = skill_critic_net.apply({'params': critic_p}, embeddings)
+
+        # --- Policy Loss (Compute per element, then mask and average) ---
+        new_action_dist = distrax.Categorical(logits=new_logits)
+        new_log_probs = new_action_dist.log_prob(actions)
+        ratio = jnp.exp(new_log_probs - log_probs_old)
+        adv_norm = (adv - adv.mean()) / (adv.std() + 1e-8) # Normalize over the whole minibatch advantages
+
+        pg_loss1 = adv_norm * ratio
+        pg_loss2 = adv_norm * jnp.clip(ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps)
+        # Per-element policy loss (before mean)
+        per_element_pg_loss = -jnp.minimum(pg_loss1, pg_loss2)
+        # Masked mean
+        policy_loss = jnp.sum(per_element_pg_loss * skill_k_mask) / (jnp.sum(skill_k_mask) + 1e-8)
+
+        # --- Value Loss (Compute per element, then mask and average) ---
+        per_element_value_loss = 0.5 * jnp.square(new_values - targets)
+        # Masked mean
+        value_loss = jnp.sum(per_element_value_loss * skill_k_mask) / (jnp.sum(skill_k_mask) + 1e-8)
+
+        # --- Entropy Bonus (Compute per element, then mask and average) ---
+        entropy = new_action_dist.entropy()
+        # Masked mean
+        entropy_bonus = jnp.sum(entropy * skill_k_mask) / (jnp.sum(skill_k_mask) + 1e-8)
+
+        # --- Total Loss ---
+        # Note: Coefficients multiply the *average* masked losses
+        total_loss = policy_loss + config.vf_coef * value_loss - config.ent_coef * entropy_bonus
+
+        metrics = {
+            "total_loss": total_loss, # Already masked and averaged correctly
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "entropy": entropy_bonus, # Store the averaged entropy bonus
+            "skill_k_active_ratio": jnp.mean(skill_k_mask.astype(jnp.float32)), # Track how much data was used
+        }
+        return total_loss, metrics
+
+    # Calculate gradients w.r.t. (embedder, policy_k, critic_k) params
+    grad_calc_fn = jax.value_and_grad(ppo_loss_fn, argnums=(0, 1, 2), has_aux=True)
+
+    (loss, metrics), grads_tuple = grad_calc_fn(
+        embedder_params, policy_params_k, critic_params_k,
+        full_minibatch # Pass the TrajectoryData object directly
+    )
+
+    return grads_tuple, metrics
 
 def mutate_selector_params(params: Any, key: chex.PRNGKey, stddev: float) -> Any:
     """Adds Gaussian noise to the selector parameters."""
@@ -392,28 +520,194 @@ def run_evolution_phase(train_state: TrainState, config: Config) -> TrainState:
     )
 
 
-@functools.partial(jax.jit, static_argnames=("config", "gbl_update_fn"))
-def run_skill_refinement_phase(train_state: TrainState, config: Config, gbl_update_fn: callable) -> TrainState:
-    """Filters data, samples batches, and updates shared skill modules via GBL."""
-    # 1. Filter replay buffer data based on successful agents (using train_state.population_fitness).
-    # 2. For each skill `k` (or in parallel using vmap if possible):
-    #    a. Sample a batch of relevant filtered data where skill `k` was used.
-    #    b. Call the GBL update function `gbl_update_fn` for skill `k`.
-    #       This function takes the skill's current state (SkillTrainState[k]) and the batch,
-    #       computes gradients using jax.grad, and uses optax to update params/opt_state.
-    #    c. Update the shared_skill_states[k] with the new state returned by `gbl_update_fn`.
-    # 3. Return train_state with updated shared_skill_states and split prng_key.
+@functools.partial(jax.jit, static_argnames=("config","action_dim")) # Jitting this whole thing might be hard
+def run_skill_refinement_phase(
+    train_state: TrainState,
+    config: Config,
+    trajectory_data: TrajectoryData,
+    action_dim: int
+    ) -> TrainState:
+    """Filters data, runs PPO updates for skills and shared embedder."""
+    print("Refining skills using PPO...")
+    key = train_state.prng_key
 
-    print("Refining skills...") # Replace with actual implementation
-    key, _ = jax.random.split(train_state.prng_key)
+    num_top_agents_float = config.population_size * 4 / 10
+    num_top_agents = int(num_top_agents_float)
+    num_top_agents = max(1, num_top_agents)
 
-    # Placeholder: Just pass state through
-    # new_shared_skill_states = update_skills(train_state, config, gbl_update_fn) # Placeholder
+    _, top_agent_indices = jax.lax.top_k(train_state.population_fitness, k=num_top_agents)
+    
+    def gather_top_agents(leaf_data):
+        # Check if it has the population dimension
+        if leaf_data.shape[0] == config.population_size:
+            return leaf_data[top_agent_indices]
+        # Otherwise, assume it doesn't have the pop dimension (shouldn't happen here)
+        return leaf_data
+    top_agent_data = jax.tree_util.tree_map(gather_top_agents, trajectory_data)
+    pop_size_filtered, traj_len = top_agent_data.observations.shape[:2]
+    num_filtered_steps = pop_size_filtered * traj_len
+    def flatten_fn(leaf_data):
+         if leaf_data.shape[:2] == (pop_size_filtered, traj_len):
+             return leaf_data.reshape(num_filtered_steps, *leaf_data.shape[2:])
+         return leaf_data
+    filtered_data = jax.tree_util.tree_map(flatten_fn, top_agent_data)
+    # ---
 
-    return train_state._replace(
-        # shared_skill_states=new_shared_skill_states, # Uncomment when implemented
+    print(f"  Filtered steps from top agents: {num_filtered_steps}")
+    min_req_steps = config.ppo_num_minibatches
+    if num_filtered_steps < min_req_steps:
+        print(f"  Skipping PPO updates: Not enough data ({num_filtered_steps}) for {config.ppo_num_minibatches} minibatches.")
+        key, _ = jax.random.split(key)
+        return train_state._replace(prng_key=key)
+
+    # --- 2. Calculate GAE for ALL filtered data ---
+    # Calculate GAE once for the whole filtered dataset
+    advantages, targets = calculate_gae(
+        rewards=filtered_data.rewards,
+        values=filtered_data.values,
+        next_values=filtered_data.next_values,
+        dones=filtered_data.dones,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda
+    )
+    # Add advantages/targets to the filtered_data pytree
+    # Ensure no key collisions if TrajectoryData already had these fields
+    filtered_data_with_adv = filtered_data.replace(
+        advantages=advantages,
+        targets=targets
+    )
+    # ---
+
+    # --- 3. Initialize Loop Variables ---
+    current_embedder_params = train_state.embedder_params
+    current_embedder_opt_state = train_state.embedder_opt_state
+    current_shared_skill_states = list(train_state.shared_skill_states)
+    embedder_tx = optax.adam(learning_rate=config.embedder_lr)
+    policy_tx = optax.adam(learning_rate=config.skill_policy_lr)
+    critic_tx = optax.adam(learning_rate=config.skill_critic_lr)
+    optimizers = (embedder_tx, policy_tx, critic_tx)
+
+    # --- 4. PPO Epoch Loop ---
+    for epoch in range(config.ppo_epochs):
+        key, shuffle_key = jax.random.split(key)
+        permuted_indices = jax.random.permutation(shuffle_key, num_filtered_steps)
+        shuffled_filtered_data = jax.tree_util.tree_map(lambda x: x[permuted_indices], filtered_data_with_adv)
+
+        accumulated_embedder_grads = jax.tree_util.tree_map(jnp.zeros_like, current_embedder_params)
+        updates_counted_for_embedder = 0
+
+        # --- 5. Minibatch Loop (Iterate over the *whole* filtered dataset) ---
+        minibatch_size = num_filtered_steps // config.ppo_num_minibatches
+        if minibatch_size == 0:
+            minibatch_size = num_filtered_steps # Handle small data case
+            actual_num_minibatches = 1
+        else:
+            actual_num_minibatches = config.ppo_num_minibatches
+
+        num_processed_steps = actual_num_minibatches * minibatch_size
+        processed_data = jax.tree_util.tree_map(
+            lambda x: x[:num_processed_steps], shuffled_filtered_data
+        )
+
+        minibatched_data = jax.tree_util.tree_map(
+            lambda x: x.reshape((actual_num_minibatches, minibatch_size) + x.shape[1:]),
+            processed_data
+        )
+
+        for i in range(actual_num_minibatches):
+            minibatch = jax.tree_util.tree_map(lambda x: x[i], minibatched_data)
+
+            # --- 6. Skill Loop (Apply updates for each skill based on this minibatch) ---
+            for k in range(config.num_skills):
+                # a. Get current states for skill k
+                skill_state_k = current_shared_skill_states[k]
+                params_tuple = (current_embedder_params, skill_state_k.policy_params, skill_state_k.critic_params)
+
+                # b. Perform PPO update step (calculates grads based on masked loss)
+                key, step_key = jax.random.split(key)
+                (embedder_grads, policy_grads_k, critic_grads_k), metrics = ppo_update_step(
+                    params_tuple,
+                    minibatch, # Pass full minibatch
+                    k,         # Pass skill index k
+                    config,
+                    action_dim
+                )
+
+                # Check if any updates happened for this skill (mask was not all False)
+                # If skill_k_active_ratio is 0, grads might be zero/NaN - skip update?
+                # Optax handles zero gradients fine, NaNs would be an issue.
+                # if metrics["skill_k_active_ratio"] > 0:
+                if True:
+
+                    # c. Update Policy and Critic for skill k immediately
+                    policy_updates, new_policy_opt_state = policy_tx.update(policy_grads_k, skill_state_k.policy_opt_state, skill_state_k.policy_params)
+                    new_policy_params_k = optax.apply_updates(skill_state_k.policy_params, policy_updates)
+
+                    critic_updates, new_critic_opt_state = critic_tx.update(critic_grads_k, skill_state_k.critic_opt_state, skill_state_k.critic_params)
+                    new_critic_params_k = optax.apply_updates(skill_state_k.critic_params, critic_updates)
+
+                    # Store the updated state for skill k back into the list
+                    current_shared_skill_states[k] = skill_state_k._replace(
+                        policy_params=new_policy_params_k,
+                        critic_params=new_critic_params_k,
+                        policy_opt_state=new_policy_opt_state,
+                        critic_opt_state=new_critic_opt_state
+                    )
+
+                    # d. Accumulate gradients for the shared embedder
+                    # Only accumulate if skill k was active in this minibatch
+                    accumulated_embedder_grads = jax.tree_util.tree_map(
+                        lambda acc, new: acc + new, accumulated_embedder_grads, embedder_grads
+                    )
+                    updates_counted_for_embedder += 1 # Count how many valid grad contributions we got
+
+                    # e. Apply embedder update periodically
+                    if updates_counted_for_embedder > 0 and updates_counted_for_embedder % config.gradient_accumulation_steps == 0:
+                         # Average over number of *accumulated* updates, not config steps
+                         num_accum = config.gradient_accumulation_steps
+                         avg_embedder_grads = jax.tree_util.tree_map(
+                             lambda g: g / num_accum, accumulated_embedder_grads
+                         )
+                         embedder_updates, new_embedder_opt_state = embedder_tx.update(
+                             avg_embedder_grads, current_embedder_opt_state, current_embedder_params
+                         )
+                         current_embedder_params = optax.apply_updates(current_embedder_params, embedder_updates)
+                         current_embedder_opt_state = new_embedder_opt_state
+
+                         # Reset accumulator
+                         accumulated_embedder_grads = jax.tree_util.tree_map(
+                             jnp.zeros_like, current_embedder_params
+                         )
+                         # Reset counter (implicitly handled by modulo next time, or explicitly reset counter here)
+                         # updates_counted_for_embedder = 0 # If resetting here
+
+            # End skill loop
+        # End minibatch loop
+
+        # Apply final embedder update for any remaining accumulated gradients at end of epoch
+        remaining_updates = updates_counted_for_embedder % config.gradient_accumulation_steps
+        if remaining_updates > 0:
+             avg_embedder_grads = jax.tree_util.tree_map(
+                 lambda g: g / remaining_updates, accumulated_embedder_grads
+             )
+             embedder_updates, new_embedder_opt_state = embedder_tx.update(
+                 avg_embedder_grads, current_embedder_opt_state, current_embedder_params
+             )
+             current_embedder_params = optax.apply_updates(current_embedder_params, embedder_updates)
+             current_embedder_opt_state = new_embedder_opt_state
+        # End epoch final embedder update
+
+    # End epoch loop
+
+    # Update the main train state
+    final_train_state = train_state._replace(
+        embedder_params=current_embedder_params,
+        embedder_opt_state=current_embedder_opt_state,
+        shared_skill_states=current_shared_skill_states,
         prng_key=key
     )
+
+    return final_train_state
 
 
 def main():
@@ -421,6 +715,9 @@ def main():
 
     env = make_craftax_env_from_name(config.env_name, True)
     env = BatchEnvWrapper(env, num_envs=config.population_size)
+    env_params = env.default_params
+    obs_shape = env.observation_space(env_params).shape
+    action_dim = env.action_space(env_params).n # Get action_dim
 
     # Define GBL update function (e.g., PPO, SAC step)
     # gbl_update_fn = create_gbl_update_function(config, SkillPolicy(), SkillCritic(), action_dim, obs_shape) # Placeholder
@@ -436,14 +733,15 @@ def main():
 
         # 1. Evaluation Phase
         train_state, trajectory_data = run_evaluation_phase(train_state, config, env, env.default_params, eval_steps_per_generation)
-        # (Log fitness, maybe other metrics from trajectories)
         print(f"Max Fitness: {jnp.max(train_state.population_fitness):.2f}")
 
         # 2. Evolution Phase
         train_state = run_evolution_phase(train_state, config)
 
         # 3. Skill Refinement Phase
-        # train_state = run_skill_refinement_phase(train_state, config, gbl_update_fn) # Uncomment when implemented
+        train_state = run_skill_refinement_phase(
+             train_state, config, trajectory_data, action_dim
+        )
 
         # (Add logging, saving checkpoints, etc.)
 
