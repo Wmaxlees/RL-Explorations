@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import time
-from typing import Any, List, Tuple, Optional, Dict
+from typing import Any, List, Tuple, Optional, Dict, Sequence
 import wandb
 
 from lib.networks import SkillSelector, SkillPolicy, SkillCritic, Embedder
@@ -16,21 +16,25 @@ from lib.env_wrappers import BatchEnvWrapper, GymnaxWrapper
 
 
 class Config:
-    population_size: int = 10 # 100
-    num_skills: int = 4 # 16
+    population_size: int = 1024
+    num_skills: int = 16
     env_name: str = "Craftax-Symbolic-v1"
     seed: int = 42
+    ppo_collect_steps: int = 64
+    fitness_eval_steps: int = 1000
+    fitness_eval_period: int = 10
+    num_update_cycles: int = 32
 
     # Embedder Hyperparameters
     embedder_hidden_dim: int = 512
     embedder_embedding_dim: int = 256
-    embedder_lr: float = 1e-3
+    embedder_lr: float = 2e-4
 
     # Skill Hyperparameters
     skill_policy_hidden_dim: int = 512
-    skill_policy_lr: float = 1e-3
+    skill_policy_lr: float = 2e-4
     skill_critic_hidden_dim: int = 512
-    skill_critic_lr: float = 1e-3
+    skill_critic_lr: float = 2e-4
 
     # Selector Hyperparameters
     selector_hidden_dim: int = 512
@@ -43,9 +47,9 @@ class Config:
 
     # PPO Hyperparameters
     ppo_epochs: int = 4
-    ppo_num_minibatches: int = 4
+    ppo_num_minibatches: int = 8
     gamma: float = 0.99
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.8
     clip_eps: float = 0.2
     vf_coef: float = 0.5
     ent_coef: float = 0.01
@@ -199,6 +203,105 @@ def mutate_selector_params(params: Any, key: chex.PRNGKey, stddev: float) -> Any
     # More sophisticated mutation might be needed for complex networks.
     return mutated_params
 
+@functools.partial(jax.jit, static_argnames=('config'))
+def run_evolution_phase_with_crossover(train_state: TrainState, config: Config) -> Tuple[TrainState, Dict]:
+    """
+    Applies EA selection and variation (elitism + crossover + mutation)
+    to the population selectors and masks.
+    """
+    print("Evolving population with crossover...")
+    key, key_p1, key_p2, key_mutate_selector, key_mutate_mask = jax.random.split(train_state.prng_key, 5)
+
+    # --- 1. Selection ---
+    # Identify elite individuals based on fitness
+    # Note: Use descending sort (-fitness) if higher fitness is better
+    # Using argsort directly assumes lower fitness is better, adjust if needed.
+    # Assuming higher fitness is better based on context:
+    elite_indices = jnp.argsort(train_state.population_fitness)[-config.num_elites:]
+    elite_fitness = train_state.population_fitness[elite_indices] # Fitness of the elites
+
+    num_offspring = config.population_size - config.num_elites
+
+    # --- 2. Variation (Crossover + Mutation) ---
+
+    # --- a) Generate Offspring Selector Parameters ---
+    # Select two parents from elites for each offspring (with replacement)
+    p1_indices = jax.random.choice(key_p1, elite_indices, shape=(num_offspring,))
+    p2_indices = jax.random.choice(key_p2, elite_indices, shape=(num_offspring,))
+
+    # Gather selector parameters of the selected parents
+    all_selector_params = train_state.population_agent_states.selector_params
+    # These parent_params trees will have leaves with shape [num_offspring, ...]
+    parent1_params = jax.tree_util.tree_map(lambda x: x[p1_indices], all_selector_params)
+    parent2_params = jax.tree_util.tree_map(lambda x: x[p2_indices], all_selector_params)
+
+    # Apply crossover (average weights)
+    # tree_map applies the function element-wise across the two trees
+    crossed_over_params = jax.tree_util.tree_map(
+        lambda p1, p2: (p1 + p2) / 2.0,
+        parent1_params,
+        parent2_params
+    )
+
+    # Apply mutation to the crossed-over parameters
+    selector_mutation_keys = jax.random.split(key_mutate_selector, num_offspring)
+    # Vmap the mutation function over offspring params and keys
+    mutated_offspring_params = jax.vmap(
+        mutate_selector_params, in_axes=(0, 0, None) # Map over params-pytree, keys, stddev is constant
+    )(crossed_over_params, selector_mutation_keys, config.selector_param_mutation_std)
+
+
+    # --- b) Generate Offspring Skill Masks ---
+    # Select base masks from one parent (e.g., parent1) and mutate
+    all_masks = train_state.population_agent_states.skill_subset_mask
+    # Base masks will have shape [num_offspring, num_skills]
+    base_offspring_masks = all_masks[p1_indices] # Using p1_indices as the base
+
+    # Apply mutation to the base masks
+    mask_mutation_keys = jax.random.split(key_mutate_mask, num_offspring)
+    # Vmap the mutation function over masks and keys
+    mutated_offspring_masks = jax.vmap(
+        mutate_skill_mask, in_axes=(0, 0, None, None) # Map over mask, key, rate, min_skills
+    )(base_offspring_masks, mask_mutation_keys, config.skill_mask_mutation_rate, config.min_skills_per_agent)
+
+
+    # --- 3. Combine Elites and New Offspring ---
+    # Get elite parameters and masks directly
+    elite_params = jax.tree_util.tree_map(lambda x: x[elite_indices], all_selector_params)
+    elite_masks = all_masks[elite_indices]
+
+    # Concatenate elite and offspring parameters
+    new_selector_params = jax.tree_util.tree_map(
+        lambda elite, offspring: jnp.concatenate([elite, offspring], axis=0),
+        elite_params,
+        mutated_offspring_params
+    )
+    # Concatenate elite and offspring masks
+    new_skill_subset_mask = jnp.concatenate([elite_masks, mutated_offspring_masks], axis=0)
+
+    # Create the new population agent states
+    new_population_agent_states = AgentState(
+        selector_params=new_selector_params,
+        skill_subset_mask=new_skill_subset_mask
+    )
+
+    # --- 4. Calculate Metrics and Update State ---
+    avg_skills_per_agent = jnp.mean(jnp.sum(new_skill_subset_mask, axis=-1))
+
+    evo_metrics = {
+        "evo/elite_fitness_mean": jnp.mean(elite_fitness),
+        "evo/elite_fitness_min": jnp.min(elite_fitness),
+        "evo/elite_fitness_max": jnp.max(elite_fitness),
+        "evo/avg_skills_per_agent": avg_skills_per_agent,
+    }
+
+    # Update the train state with the new population and PRNG key
+    new_train_state = train_state._replace(
+        population_agent_states=new_population_agent_states,
+        prng_key=key # Use the key generated at the start of the function
+    )
+    return new_train_state, evo_metrics
+
 def mutate_skill_mask(mask: chex.Array, key: chex.PRNGKey, rate: float, min_skills: int) -> chex.Array:
     """Flips bits in the skill mask with a given probability, ensuring min_skills."""
     mutation_noise = jax.random.uniform(key, mask.shape)
@@ -325,8 +428,17 @@ def init_train_state(config: Config, env: GymnaxWrapper) -> TrainState:
     )
 
 
-@functools.partial(jax.jit, static_argnames=("config", "env", "num_steps"))
-def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWrapper, env_params: Any, num_steps: int) -> Tuple[TrainState, Any]:
+@functools.partial(jax.jit, static_argnames=("config", "env", "num_steps", "collect_full_trajectory", "obs_shape", "action_dim"))
+def run_evaluation_phase(
+    train_state: TrainState,
+    config: Config,
+    env: GymnaxWrapper,
+    env_params: Any,
+    num_steps: int,
+    collect_full_trajectory: bool,
+    obs_shape: Sequence[int],
+    action_dim: int
+) -> Tuple[TrainState, Optional[TrajectoryData], Dict]:
     """
     Runs agents in the environment, collects data, calculates fitness.
     """
@@ -339,17 +451,35 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
     skill_policy_template = SkillPolicy(hidden_dim=config.skill_policy_hidden_dim, action_dim=action_dim)
     skill_critic_template = SkillCritic(hidden_dim=config.skill_critic_hidden_dim)
 
+    stacked_policy_params = jax.tree_util.tree_map(
+        lambda *x: jnp.stack(x), *[s.policy_params for s in train_state.shared_skill_states]
+    )
+    stacked_critic_params = jax.tree_util.tree_map(
+        lambda *x: jnp.stack(x), *[s.critic_params for s in train_state.shared_skill_states]
+    )
+
     initial_carry = {
         "key": train_state.prng_key,
         "obs": train_state.obs,
         "env_state": train_state.env_state,
         "accumulated_reward": jnp.zeros(config.population_size, dtype=jnp.float32),
         "total_skills_selected": jnp.zeros((config.population_size, config.num_skills), dtype=jnp.int32),
+        # Initialize trajectory storage if needed
+        "trajectory_obs": jnp.zeros((num_steps, config.population_size, *obs_shape), dtype=train_state.obs.dtype) if collect_full_trajectory else None,
+        "trajectory_actions": jnp.zeros((num_steps, config.population_size), dtype=jnp.int32) if collect_full_trajectory else None,
+        "trajectory_log_probs": jnp.zeros((num_steps, config.population_size), dtype=jnp.float32) if collect_full_trajectory else None,
+        "trajectory_rewards": jnp.zeros((num_steps, config.population_size), dtype=jnp.float32) if collect_full_trajectory else None,
+        "trajectory_dones": jnp.zeros((num_steps, config.population_size), dtype=bool) if collect_full_trajectory else None,
+        "trajectory_values": jnp.zeros((num_steps, config.population_size), dtype=jnp.float32) if collect_full_trajectory else None,
+        "trajectory_skill_indices": jnp.zeros((num_steps, config.population_size), dtype=jnp.int32) if collect_full_trajectory else None,
+        "trajectory_agent_indices": jnp.zeros((num_steps, config.population_size), dtype=jnp.int32) if collect_full_trajectory else None,
+        "trajectory_next_values": jnp.zeros((num_steps, config.population_size), dtype=jnp.float32) if collect_full_trajectory else None,
     }
 
-    def step_env_scan_body(carry, _unused_step_idx):
-        key, current_obs, current_env_state, accumulated_reward = \
-            carry["key"], carry["obs"], carry["env_state"], carry["accumulated_reward"]
+    def step_env_scan_body(carry, step_idx):
+        key = carry["key"]
+        current_obs = carry["obs"]
+        current_env_state = carry["env_state"]
         accumulated_reward = carry["accumulated_reward"]
         total_skills_selected = carry["total_skills_selected"]
 
@@ -357,136 +487,142 @@ def run_evaluation_phase(train_state: TrainState, config: Config, env: GymnaxWra
 
         key, select_key, policy_key, step_key = jax.random.split(key, 4)
 
-        embeddings = embedder_net.apply({'params': train_state.embedder_params}, current_obs) # Shape [P, embed_dim]
+        # 1. Get Embeddings
+        embeddings = embedder_net.apply({'params': train_state.embedder_params}, current_obs) # [P, embed_dim]
 
+        # 2. Select Skill
         agent_states = train_state.population_agent_states # Pytree: params[P,...], mask[P, N_skill]
-        selector_logits = jax.vmap(
-        selector_net.apply, in_axes=({'params': 0}, 0, 0)
-            )(
-                {'params': agent_states.selector_params}, embeddings, agent_states.skill_subset_mask
-            ) # Shape [P, N_skill]
-        skill_indices_k = jax.random.categorical(select_key, selector_logits) # Shape [P]
+        selector_logits = jax.vmap(selector_net.apply, in_axes=({'params': 0}, 0, 0))(
+            {'params': agent_states.selector_params}, embeddings, agent_states.skill_subset_mask
+        ) # [P, N_skill]
+        skill_indices_k = jax.random.categorical(select_key, selector_logits) # [P]
+        new_total_skills_selected = total_skills_selected + jax.nn.one_hot(skill_indices_k, num_classes=config.num_skills, dtype=jnp.int32)
 
-        skill_one_hot = jax.nn.one_hot(skill_indices_k, num_classes=config.num_skills, dtype=jnp.int32)
-        new_total_skills_selected = total_skills_selected + skill_one_hot
-
-        stacked_policy_params = jax.tree_util.tree_map(
-            lambda *x: jnp.stack(x), *[s.policy_params for s in train_state.shared_skill_states]
-        )
-        # Stack critic params: List[Pytree[Array]] -> Pytree[Array[N_skill, ...]]
-        stacked_critic_params = jax.tree_util.tree_map(
-            lambda *x: jnp.stack(x), *[s.critic_params for s in train_state.shared_skill_states]
+        # 3a. Gather selected policy parameters for each agent in the batch
+        selected_policy_params = jax.tree_util.tree_map(
+            lambda stacked_leaf: stacked_leaf[skill_indices_k], # Index first dim (skills) using chosen indices per agent
+            stacked_policy_params
         )
 
-        def apply_policy_stacked(stacked_params, embeddings_batch):
-            # Vmap the apply function over the N_skill dimension of params
-            # in_axes: params pytree (0), embeddings (None - broadcast)
-            return jax.vmap(
-                skill_policy_template.apply, in_axes=({'params': 0}, None)
-            )(
-                {'params': stacked_params}, embeddings_batch
-            ) # Output shape [N_skill, P, action_dim]
+        # 3b. Apply policy: vmap over population (axis 0) of selected_params and embeddings
+        chosen_skill_policy_logits = jax.vmap(
+            lambda params_p, embedding_p: skill_policy_template.apply({'params': params_p}, embedding_p),
+            in_axes=(0, 0)
+        )(selected_policy_params, embeddings) # Output: [P, action_dim]
 
-        def apply_critic_stacked(stacked_params, embeddings_batch):
-            # Vmap the apply function over the N_skill dimension of params
-            return jax.vmap(
-                skill_critic_template.apply, in_axes=({'params': 0}, None)
-            )(
-                {'params': stacked_params}, embeddings_batch
-            ) # Output shape [N_skill, P]
+        # 3c. Gather selected critic parameters for each agent
+        selected_critic_params = jax.tree_util.tree_map(
+            lambda stacked_leaf: stacked_leaf[skill_indices_k],
+            stacked_critic_params
+        )
 
-        all_policy_logits = apply_policy_stacked(stacked_policy_params, embeddings)
-        all_values = apply_critic_stacked(stacked_critic_params, embeddings)
+        # 3d. Apply critic: vmap over population
+        chosen_skill_values = jax.vmap(
+            lambda params_p, embedding_p: skill_critic_template.apply({'params': params_p}, embedding_p),
+            in_axes=(0, 0)
+        )(selected_critic_params, embeddings) # Output: [P]
 
-        batch_indices = jnp.arange(config.population_size)
-        chosen_skill_policy_logits = all_policy_logits[skill_indices_k, batch_indices, :] # Shape [P, action_dim]
-        chosen_skill_values = all_values[skill_indices_k, batch_indices] # Shape [P]
-
-        # Create action distribution
         action_dist = distrax.Categorical(logits=chosen_skill_policy_logits)
-        actions = action_dist.sample(seed=policy_key) # Shape [P]
-        log_probs = action_dist.log_prob(actions) # Shape [P]
+        actions = action_dist.sample(seed=policy_key) # [P]
+        log_probs = action_dist.log_prob(actions)     # [P]
 
-        # 4. Step environment
+        # 4. Step Environment
+        # BatchEnvWrapper handles vmapping the step function
         next_obs, next_env_state, rewards, dones, _ = env.step(
             step_key, current_env_state, actions, env_params
-        )
+        ) # All shapes [P, ...]
 
-        # 5. Get value estimate for the *next* state (for GAE) using chosen skill's critic
+        # 5. Get Value estimate for the *next* state (V(s')) using the same chosen critic
         next_embeddings = embedder_net.apply({'params': train_state.embedder_params}, next_obs)
+        chosen_skill_next_values = jax.vmap(
+        lambda params_p, next_embedding_p: skill_critic_template.apply({'params': params_p}, next_embedding_p),
+            in_axes=(0, 0)
+        )(selected_critic_params, next_embeddings) # Output: [P]
 
-        # Apply all critics to next embeddings (Can reuse vmapped function)
-        all_next_values = apply_critic_stacked(stacked_critic_params, next_embeddings) # Shape [N_skill, P]
-
-        # Select based on the *same* skill k chosen for the action
-        chosen_skill_next_values = all_next_values[skill_indices_k, batch_indices] # Shape [P]
-        # Handle terminal states: value should be 0 if done
+        # Correct for terminal states (remains the same)
         chosen_skill_next_values = jnp.where(dones, 0.0, chosen_skill_next_values)
 
+        # --- Store transition data if collecting ---
+        next_carry = carry.copy() # Start with a copy of the current carry
+        if collect_full_trajectory:
+            idx = step_idx # Use the scan index directly
+            next_carry["trajectory_obs"] = next_carry["trajectory_obs"].at[idx].set(current_obs)
+            next_carry["trajectory_actions"] = next_carry["trajectory_actions"].at[idx].set(actions)
+            next_carry["trajectory_log_probs"] = next_carry["trajectory_log_probs"].at[idx].set(log_probs)
+            next_carry["trajectory_rewards"] = next_carry["trajectory_rewards"].at[idx].set(rewards)
+            next_carry["trajectory_dones"] = next_carry["trajectory_dones"].at[idx].set(dones)
+            next_carry["trajectory_values"] = next_carry["trajectory_values"].at[idx].set(chosen_skill_values) # V(s_t)
+            next_carry["trajectory_skill_indices"] = next_carry["trajectory_skill_indices"].at[idx].set(skill_indices_k)
+            next_carry["trajectory_agent_indices"] = next_carry["trajectory_agent_indices"].at[idx].set(agent_indices_step)
+            next_carry["trajectory_next_values"] = next_carry["trajectory_next_values"].at[idx].set(chosen_skill_next_values) # V(s_{t+1})
 
-        # --- Store transition data for this step ---
-        transition = {
-            "observations": current_obs,
-            "actions": actions,
-            "log_probs": log_probs,
-            "rewards": rewards,
-            "dones": dones,
-            "values": chosen_skill_values, # V(s_t)
-            "skill_indices": skill_indices_k,
-            "agent_indices": agent_indices_step,
-            "next_values": chosen_skill_next_values # V(s_{t+1})
-        }
-
+        # --- Update carry for next step ---
         new_accumulated_reward = accumulated_reward + rewards
-        next_carry = {
+        next_carry.update({
             "key": key,
             "obs": next_obs,
             "env_state": next_env_state,
             "accumulated_reward": new_accumulated_reward,
             "total_skills_selected": new_total_skills_selected
-        }
-        return next_carry, transition
+        })
+        # Return dummy output for scan, actual data is stored in carry
+        return next_carry, None
 
     # --- Run the scan over num_steps ---
-    final_carry, collected_transitions_stacked = jax.lax.scan(
-         step_env_scan_body, initial_carry, None, length=num_steps # Scan over T steps
+    final_carry, _ = jax.lax.scan(
+         step_env_scan_body, initial_carry, jnp.arange(num_steps) # Pass step indices
     )
-    # collected_transitions_stacked is a pytree where leaves have shape [T, P, ...]
 
     # Extract final state parts and accumulated rewards
     final_key = final_carry["key"]
     final_obs = final_carry["obs"]
     final_env_state = final_carry["env_state"]
-    # Use accumulated reward over the trajectory as fitness
-    final_fitness = final_carry["accumulated_reward"]
-    final_total_skills_selected = final_carry["total_skills_selected"] # Shape [P, N_skill]
+    final_fitness = final_carry["accumulated_reward"] # Use accumulated reward as fitness
+    final_total_skills_selected = final_carry["total_skills_selected"] # [P, N_skill]
 
-    # Transpose collected data to [P, T, ...]
-    trajectory_data_transposed = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), collected_transitions_stacked)
+    # --- Pack trajectory data if collected ---
+    trajectory_data = None
+    if collect_full_trajectory:
+        # Transpose collected data from [T, P, ...] to [P, T, ...]
+        trajectory_data_transposed = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1) if x is not None else None,
+             {k: final_carry[k] for k in initial_carry if k.startswith("trajectory_")}
+        )
+        # Rename keys to match TrajectoryData fields
+        trajectory_data_renamed = {}
+        for k, v in trajectory_data_transposed.items():
+            new_key = k.replace("trajectory_", "")
+            if new_key == "obs":
+                new_key = "observations"
+            trajectory_data_renamed[new_key] = v
+        trajectory_data = TrajectoryData(**trajectory_data_renamed)
 
-    # Pack into TrajectoryData structure
-    trajectory_data = TrajectoryData(**trajectory_data_transposed)
 
+    # --- Calculate Metrics ---
+    avg_skill_usage_fraction = jnp.mean(final_total_skills_selected / num_steps, axis=0) # [N_skill]
     eval_metrics = {
-        "eval/fitness_mean": jnp.mean(final_fitness),
-        "eval/fitness_median": jnp.median(final_fitness),
-        "eval/fitness_max": jnp.max(final_fitness),
-        "eval/fitness_min": jnp.min(final_fitness),
-        "eval/fitness_std": jnp.std(final_fitness),
-        "eval/avg_skill_usage_fraction": jnp.mean(final_total_skills_selected / num_steps, axis=0), # Average fraction usage per skill across pop [N_skill]
-        # Add more metrics as needed
+        "fitness_mean": jnp.mean(final_fitness),
+        "fitness_median": jnp.median(final_fitness),
+        "fitness_max": jnp.max(final_fitness),
+        "fitness_min": jnp.min(final_fitness),
+        "fitness_std": jnp.std(final_fitness),
+        "avg_skill_usage_fraction": avg_skill_usage_fraction, # Average fraction usage per skill across pop
     }
+    # Prefix metrics based on whether it was a long or short eval
+    prefix = "eval_long/" if num_steps == config.fitness_eval_steps else "eval_short/"
+    eval_metrics = {prefix + k: v for k, v in eval_metrics.items()}
 
-    # Update TrainState
+
+    # --- Update TrainState (only obs, env_state, key, timestep) ---
+    # Fitness is updated separately, esp. after long evaluation
     new_train_state = train_state._replace(
         prng_key=final_key,
-        obs=final_obs, # Store the very last obs
-        env_state=final_env_state, # Store the last env state
-        population_fitness=final_fitness,
-        timestep=train_state.timestep + num_steps * config.population_size
+        obs=final_obs,
+        env_state=final_env_state,
+        timestep=train_state.timestep + num_steps * config.population_size # Increment global timestep
     )
 
-    return new_train_state, trajectory_data, eval_metrics
+    return new_train_state, trajectory_data, final_fitness, eval_metrics
 
 
 @functools.partial(jax.jit, static_argnames=('config'))
@@ -562,7 +698,7 @@ def run_skill_refinement_phase(
     config: Config,
     trajectory_data: TrajectoryData,
     action_dim: int
-    ) -> TrainState:
+    ) -> Tuple[TrainState, Dict]:
     """Filters data, runs PPO updates for skills and shared embedder."""
     print("Refining skills using PPO...")
     key = train_state.prng_key
@@ -820,57 +956,121 @@ def main():
     env = BatchEnvWrapper(env, num_envs=config.population_size)
     env_params = env.default_params
     obs_shape = env.observation_space(env_params).shape
-    action_dim = env.action_space(env_params).n # Get action_dim
+    action_dim = env.action_space(env_params).n
 
     # Initialize training state
     train_state = init_train_state(config, env)
 
-    num_generations = 100 # Example
-    eval_steps_per_generation = 100 # Example
-
     start_time = time.time()
 
-    for generation in range(num_generations):
-        gen_start_time = time.time()
-        logs = {"generation": generation, "timesteps": train_state.timestep}
-        print(f"\n--- Generation {generation} ---")
+    for update_cycle in range(config.num_update_cycles):
+        cycle_start_time = time.time()
+        logs = {"update_cycle": update_cycle, "timesteps": train_state.timestep}
+        print(f"\n--- Update Cycle {update_cycle} ---")
 
-        # 1. Evaluation Phase
-        eval_start_time = time.time()
-        train_state, trajectory_data, eval_metrics = run_evaluation_phase(train_state, config, env, env.default_params, eval_steps_per_generation)
-        eval_time = time.time() - eval_start_time
-        logs.update({k: float(v) for k, v in eval_metrics.items() if 'avg_skill_usage_fraction' not in k})
-        for i, usage in enumerate(eval_metrics["eval/avg_skill_usage_fraction"]):
-            logs[f"eval/skill_{i}_usage_fraction"] = float(usage)
-        logs["timing/eval_phase_sec"] = eval_time
-        print(f"Max Fitness: {jnp.max(train_state.population_fitness):.2f}")
+        # 1. Short Evaluation Phase (Data Collection for PPO)
+        collect_start_time = time.time()
+        # Run for ppo_collect_steps, collect full trajectory data
+        train_state, trajectory_data_for_ppo, _, short_eval_metrics = run_evaluation_phase(
+            train_state, config, env, env_params,
+            num_steps=config.ppo_collect_steps,
+            collect_full_trajectory=True,
+            obs_shape=obs_shape,
+            action_dim=action_dim
+        )
+        collect_time = time.time() - collect_start_time
+        logs.update({k: float(v) for k, v in short_eval_metrics.items() if 'avg_skill_usage_fraction' not in k})
+        # Log skill usage during short eval separately if desired
+        for i, usage in enumerate(short_eval_metrics.get(f"eval_short/avg_skill_usage_fraction", [])):
+            logs[f"eval_short/skill_{i}_usage_fraction"] = float(usage)
+        logs["timing/collect_phase_sec"] = collect_time
+        print(f"  PPO Data Collection: {config.ppo_collect_steps} steps completed.")
 
-        # 2. Evolution Phase
-        evo_start_time = time.time()
-        train_state, evo_metrics = run_evolution_phase(train_state, config)
-        evo_time = time.time() - evo_start_time
-        logs.update({k: float(v) for k, v in evo_metrics.items()}) # Convert JAX scalars
-        logs["timing/evo_phase_sec"] = evo_time
+        # Check if trajectory data was actually collected (it should have been)
+        if trajectory_data_for_ppo is None:
+             print("Error: trajectory_data_for_ppo is None after short evaluation phase!")
+             # Handle error appropriately, maybe skip refinement?
+             wandb.log({"error": "Missing PPO trajectory data"})
+             continue # Skip to next cycle or break
 
-        # 3. Skill Refinement Phase
+        # 2. Skill Refinement Phase (PPO Update)
         refine_start_time = time.time()
         train_state, ppo_metrics = run_skill_refinement_phase(
-             train_state, config, trajectory_data, action_dim
+             train_state, config, trajectory_data_for_ppo, action_dim
         )
         refine_time = time.time() - refine_start_time
-        logs.update(ppo_metrics) # Already floats from the function
+        logs.update(ppo_metrics) # PPO metrics are already floats
         logs["timing/refine_phase_sec"] = refine_time
+        print(f"  Skill Refinement (PPO) completed.")
 
-        gen_time = time.time() - gen_start_time
-        logs["timing/generation_sec"] = gen_time
+        # 3. Conditional Long Evaluation & Evolution
+        if update_cycle % config.fitness_eval_period == 0:
+            print(f"  --- Performing Long Evaluation & Evolution (Cycle {update_cycle}) ---")
+            evo_metrics = {} # Initialize empty dict
+
+            # a. Long Evaluation Phase (Fitness Calculation)
+            long_eval_start_time = time.time()
+            # Run for fitness_eval_steps, DO NOT collect full trajectory data
+            train_state_after_long_eval, _, _, long_eval_metrics = run_evaluation_phase(
+                train_state, config, env, env_params,
+                num_steps=config.fitness_eval_steps,
+                collect_full_trajectory=False,
+                obs_shape=obs_shape,
+                action_dim=action_dim
+            )
+            long_eval_time = time.time() - long_eval_start_time
+            # Extract the accurate fitness from the metrics
+            accurate_population_fitness = long_eval_metrics.get("eval_long/fitness_mean", None)
+
+            _, _, accurate_population_fitness, long_eval_metrics = run_evaluation_phase(train_state, config, env, env_params, config.fitness_eval_steps, True, obs_shape, action_dim)
+
+            logs.update({k: float(v) for k, v in long_eval_metrics.items() if 'avg_skill_usage_fraction' not in k})
+            # Log skill usage during long eval separately
+            for i, usage in enumerate(long_eval_metrics.get(f"eval_long/avg_skill_usage_fraction", [])):
+                logs[f"eval_long/skill_{i}_usage_fraction"] = float(usage)
+            logs["timing/long_eval_phase_sec"] = long_eval_time
+            print(f"      Long Evaluation: {config.fitness_eval_steps} steps completed. Max Fitness: {jnp.max(accurate_population_fitness):.2f}")
+
+
+            # b. Evolution Phase
+            evo_start_time = time.time()
+            # Run evolution using the *accurate* fitness we just calculated
+            train_state, evo_metrics = run_evolution_phase_with_crossover(train_state, config)
+            evo_time = time.time() - evo_start_time
+            logs.update({k: float(v) for k, v in evo_metrics.items()}) # Convert JAX scalars if any
+            logs["timing/evo_phase_sec"] = evo_time
+            print(f"      Evolution completed.")
+
+        else:
+            # If not an evolution cycle, log placeholder or skip evo metrics
+            logs["timing/long_eval_phase_sec"] = 0.0
+            logs["timing/evo_phase_sec"] = 0.0
+            # Ensure fitness/evo keys exist for consistent WandB logging if needed
+            logs.update({
+                "eval_long/fitness_mean": float('nan'), "eval_long/fitness_max": float('nan'),
+                "evo/elite_fitness_mean": float('nan'), "evo/avg_skills_per_agent": float('nan'),
+                 # Add others as needed
+            })
+
+
+        # --- Logging ---
+        cycle_time = time.time() - cycle_start_time
+        logs["timing/update_cycle_sec"] = cycle_time
         total_elapsed_time = time.time() - start_time
         logs["timing/total_elapsed_sec"] = total_elapsed_time
-        logs["timing/sps"] = (eval_steps_per_generation * config.population_size) / gen_time # Steps per second
+        # Calculate SPS based on short eval steps + long eval steps (amortized)
+        steps_this_cycle = config.ppo_collect_steps * config.population_size
+        if update_cycle % config.fitness_eval_period == 0:
+             steps_this_cycle += config.fitness_eval_steps * config.population_size # Add long eval steps
+        # SPS might be better calculated based on total steps over total time
+        logs["timing/sps_approx"] = logs["timesteps"] / total_elapsed_time if total_elapsed_time > 0 else 0
 
         wandb.log(logs)
+        print(f"  Cycle {update_cycle} finished in {cycle_time:.2f}s. Total time: {total_elapsed_time:.2f}s.")
 
-        # (Add saving checkpoints, etc.)
+        # (Add saving checkpoints periodically if needed)
 
+    print("\nTraining finished.")
     wandb.finish()
 
 if __name__ == "__main__":
