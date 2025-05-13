@@ -9,6 +9,10 @@ These two issues are important bottlenecks that hold RL back from seeing much re
 hold code for experiments I do on understanding and improving these two aspects of RL.
 
 ## Experiments
+### The Bard
+An RLAIF trained model using Gemma3-1b as a base and Gemma3 in Ollama as a critic. The model is trained to output the best
+poem, as judged by Gemma3, given a noun.
+
 ### JEPA-RL
 Yan LaCun et al. have recently released several papers around an embedding architecture they call Joint Embedding
 Predictive Architectures (JEPA) [paper](https://ai.meta.com/research/publications/revisiting-feature-prediction-for-learning-visual-representations-from-video/).
