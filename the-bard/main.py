@@ -60,11 +60,11 @@ SFT_TRAINING_ARGS = TrainingArguments(
 # GRPO Config
 GRPO_TRAINING_ARGS = GRPOConfig(
     output_dir=RL_MODEL_DIR,
-    learning_rate=1e-6,
+    learning_rate=5e-6,
     per_device_train_batch_size=1, # Number of prompts processed at once. Each prompt generates `num_generations` poems.
     gradient_accumulation_steps=4, # Effective batch size = per_device_train_batch_size * num_devices * gradient_accumulation_steps
-    max_prompt_length=280, # Max length of the prompt
-    max_completion_length=(GENERATOR_CONFIG.n_positions * 2) // 3, # Max length of the generated completion
+    max_prompt_length=768, # Max length of the prompt
+    max_completion_length=280, # Max length of the generated completion
     num_generations=2, # Number of poems to generate per prompt for group evaluation.
     num_train_epochs=10, # TODO: Number of PPO-like epochs per GRPO iteration (how many times to iterate over collected rollouts)
     beta=0.05, # KL divergence coefficient (TRL GRPOTrainer uses 'beta' for KL)
@@ -72,10 +72,10 @@ GRPO_TRAINING_ARGS = GRPOConfig(
     remove_unused_columns=False,
     seed=42,
     report_to="wandb",
-    temperature=1.1,
+    temperature=1.2,
 )
 GRPO_ITERATIONS = 30 # TODO: Total number of GRPO training iterations (outer loop)
-DIVERSITY_WEIGHT = 0.01 # TODO: Tune weight for the diversity component of the reward
+DIVERSITY_WEIGHT = 0.1 # TODO: Tune weight for the diversity component of the reward
 
 # --- Helper Functions (Dataset and Tokenizer same as before) ---
 def create_dummy_poem_dataset(filepath="poems.jsonl", num_poems=100):
@@ -124,7 +124,7 @@ def get_ollama_score_for_single_poem(poem_text: str, ollama_model: str, retries=
 2.  **Score for Specific Inputs:**
     * If the "Poem" text is empty, consists ONLY of whitespace (newlines, spaces), or ONLY of non-alphanumeric characters (like '_______' or '.......'), assign a **Score of 1**.
     * If the "Poem" text appears to be plagiarized or a trivial modification of a well-known work, assign a **Score of 1 to 3**
-    * If the "Poem" text contains any html tags, asign a **Score of 1**
+    * If the "Poem" text contains any html tags, assign a **Score of 1**
     * For actual poetry, use the 1-10 scale based on quality.
 
 **Scoring Guidelines for Actual Poetry:**
@@ -132,33 +132,6 @@ def get_ollama_score_for_single_poem(poem_text: str, ollama_model: str, retries=
 * 4-6: Mediocre. Coherent but lacks creativity or originality.
 * 7-8: Good. Shows creativity and some originality.
 * 9-10: Excellent. Highly creative, original, impactful.
-
-**Examples of Scoring:**
-
-Example 1:
-Poem:
-"The sun shines bright
-Upon the day so light
-A lovely sight"
-Score (1-10): 5
-
-Example 2:
-Poem:
-"Roses are red, violets are blue, sugar is sweet, and so are you."
-Score (1-10): 3 (Coherent, but very unoriginal cliché)
-
-Example 3:
-Poem:
-"
-
-
-"
-Score (1-10): 1
-
-Example 4:
-Poem:
-"________________"
-Score (1-10): 1
 
 Now, evaluate the following:
 
@@ -196,31 +169,34 @@ def get_ollama_pairwise_preference(poem_a: str, poem_b: str, original_prompt_tex
     Returns 'A', 'B', or None if it cannot decide or an error occurs.
     """
 
-    prompt = f"""You are a discerning literary critic. You will be given an original prompt and two generated poems, Poem A and Poem B, created in response to that prompt.
+    prompt = f"""You are a strict literary critic. You will evaluate two poems, Poem A and Poem B, based on an original prompt.
 
-                Your task is to determine which poem is superior.
+Original Prompt: "{original_prompt_text}"
 
-                Original Prompt: "{original_prompt_text}"
+**CRITICAL FIRST STEP: Assess Basic Readability and Meaning.**
+- A poem is "UNACCEPTABLE" if it is largely nonsensical, consists of random characters/symbols, is primarily whitespace, or clearly fails to form meaningful English phrases relevant to the prompt. The example "Shadows. elfربیარა. NaseenNaseen й." is UNACCEPTABLE.
+- An output like "_________________" is UNACCEPTABLE.
+- An output like "<b><b><b><b>" is UNACCEPTABLE.
 
-                Now, considering that prompt, please evaluate the two generated poems below (Poem A and Poem B).
-                Determine which poem is superior based on these criteria, in order of importance:
-                1.  **Coherence & Clarity:** The poem must be understandable.
-                2.  **Relevance to Original Prompt.**
-                3.  **Meaningful Content:** The poem must use actual words to express ideas or imagery. Avoid rewarding empty, symbolic, or overly simplistic/repetitive non-poetic outputs.
-                4.  **Creativity & Originality:** Does it offer fresh perspectives or unique expressions, avoiding clichés and apparent plagiarism?
-                5.  **Development & Substantiality:** Does one poem offer a more developed exploration of its subject or imagery? While conciseness is a virtue, a poem that is very brief because it is underdeveloped or incomplete should be viewed less favorably than a more thoughtfully extended piece that maintains quality. Consider if the poem feels "complete" for its idea.
-                6.  **Emotional Impact & Poetic Devices:** Does it evoke feeling? Are literary techniques used effectively?
+**Your Task:**
+1. If Poem A is UNACCEPTABLE and Poem B is UNACCEPTABLE, respond with: **NEITHER**
+2. If Poem A is UNACCEPTABLE but Poem B is acceptable, respond with: **B**
+3. If Poem B is UNACCEPTABLE but Poem A is acceptable, respond with: **A**
+4. If BOTH Poem A and Poem B are acceptable (i.e., not UNACCEPTABLE gibberish), then choose which is better based on:
+    a. Emotional Resonance & Depth (Most Important)
+    b. Relevance to the Original Prompt
+    c. Coherence, Creativity & Originality
+    d. Vivid Imagery & Sensory Language
+    e. (Less Important) Poetic Form/Structure (genuine feeling is preferred over perfect but flat form)
 
-                Even if both poems are of similar overall quality, please make a choice for the one you find even slightly preferable according to these criteria.
+**Response Format: Respond with ONLY a single word: 'A', 'B', or 'NEITHER'.** Do not add scores or any other text.
 
-                Poem A:
-                {poem_a[:GRPO_TRAINING_ARGS.max_completion_length]}
+Poem A:
+{poem_a}
 
-                Poem B:
-                {poem_b[:GRPO_TRAINING_ARGS.max_completion_length]}
-
-                Which poem is better (A or B)? Respond with only a single letter: 'A' or 'B'.
-                """
+Poem B:
+{poem_b}
+"""
     try:
         response = ollama.generate(
             model=ollama_model,
@@ -229,8 +205,8 @@ def get_ollama_pairwise_preference(poem_a: str, poem_b: str, original_prompt_tex
             options={"temperature": OLLAMA_JUDGE_TEMPERATURE} # Keep low for consistency
         )
         answer = response['response'].strip().upper()
-        if answer in ["A", "B"]:
-            print(f"    Ollama Judge Preference: {answer}")
+        if answer in ["A", "B", "NEITHER"]:
+            print(f"    Ollama Judge Evaluation: {answer}")
             return answer
         else:
             print(f"    Ollama judge returned ambiguous preference: '{answer}'.")
@@ -406,9 +382,15 @@ def pairwise_grpo_reward_function(completions: list[str], prompts: list[str], **
 
         rewards_base = [0.0, 0.0] 
         if preference == "A":
-            rewards_base = [0.5, -0.5] # Example: 0.5 for winner, -0.5 for loser
+            score = get_ollama_score_for_single_poem(actual_generated_part_a, OLLAMA_JUDGE_MODEL)
+            score = score / 10.0
+            rewards_base = [score, score-1]
         elif preference == "B":
-            rewards_base = [-0.5, 0.5]
+            score = get_ollama_score_for_single_poem(actual_generated_part_b, OLLAMA_JUDGE_MODEL)
+            score = score / 10.0
+            rewards_base = [score-1, score]
+        elif preference == "NEITHER":
+            rewards_base = [-0.5, -0.5]
 
         # Diversity calculation (between poem_a and poem_b of this pair)
         diversity_score_val = 0.0
@@ -420,12 +402,14 @@ def pairwise_grpo_reward_function(completions: list[str], prompts: list[str], **
                     bleu = sentence_bleu([token_b], token_a, smoothing_function=SmoothingFunction().method1, weights=(0.5,0.5))
                     diversity_score_val = 1.0 - bleu
                 except ZeroDivisionError:
-                    diversity_score_val = 1.0 
+                    diversity_score_val = 1.0
+
+        adjusted_diversity_modifier = (diversity_score_val - 0.5) * 2.0
 
         # Combine rewards for the current pair
         current_pair_rewards = [
-            rewards_base[0] + (DIVERSITY_WEIGHT * diversity_score_val),
-            rewards_base[1] + (DIVERSITY_WEIGHT * diversity_score_val)
+            rewards_base[0] + (DIVERSITY_WEIGHT * adjusted_diversity_modifier),
+            rewards_base[1] + (DIVERSITY_WEIGHT * adjusted_diversity_modifier)
         ]
         all_rewards.extend(current_pair_rewards)
 
@@ -1114,7 +1098,26 @@ def main():
         for p_text in prompts:
             # If using an INSTRUCT model, apply the chat template
             if "-it" in PRETRAINED_MODEL_NAME or "instruct" in PRETRAINED_MODEL_NAME.lower():
-                p_text = "Write a poem inspired by the poem prompt. Only include text of the full poem and do not add any other text. Keep the poem short. Be creative.\n\nPoem prompt:\n" + p_text
+                p_text = f"""Your mission is to compose an English language poem inspired by the 'Poem prompt' below.
+
+                        **CRITICAL FORMATTING REQUIREMENTS:**
+                        * **NO PREAMBLE OR POSTAMBLE:** Your response MUST begin *directly* with the first word of the poem and end with the last word of the poem.
+                        * **POEM TEXT ONLY:** Do NOT include ANY introductory phrases, salutations, explanations, self-commentary (like "Here is your poem:"), or any text whatsoever before the first line of the poem or after the last line.
+                        * **OUTPUT THE POEM AND NOTHING ELSE.**
+
+                        **Primary Goal: Evoke a powerful and genuine emotional response.** Your main objective is to make the reader *feel* something deeply. The emotional resonance of your poem is more important than strict adherence to traditional poetic forms or complex structures.
+
+                        **Guidance for Crafting an Emotional Poem:**
+                        * **Connect Emotionally:** Tap into the core feelings, moods, or human experiences related to the 'Poem prompt'.
+                        * **Use Vivid & Sensory Language:** Paint pictures with words. Appeal to sight, sound, touch, smell, and taste to immerse the reader and enhance the emotional tone.
+                        * **Show, Don't Just Tell:** Convey emotions through actions, settings, specific details, and metaphors rather than stating them directly.
+                        * **Originality & Authenticity:** Strive for a fresh voice and perspective. Avoid clichés, as they often dull emotional impact.
+                        * **Form & Structure as a Tool:** While rhythm, line breaks, and stanzas can contribute to the poem's effect, they should serve the emotional content. Feel free to use a more organic or free-verse style if it better conveys the intended feeling. Prioritize impact over rigid rules.
+
+                        Poem prompt: {p_text}
+
+                        Poem:
+                    """
                 messages = [
                     {"role": "user", "content": p_text}
                 ]
@@ -1185,7 +1188,7 @@ def main():
         input_ids=input_ids,
         max_new_tokens=GRPO_TRAINING_ARGS.max_completion_length, # Use consistent length
         do_sample=True,
-        temperature=0.8, # Use a reasonable temperature for creative generation
+        temperature=1.2,
         top_k=50,
         top_p=0.95,
         num_return_sequences=1,
